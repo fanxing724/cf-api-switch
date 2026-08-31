@@ -724,5 +724,78 @@ section('11. 渠道请求统计');
 }
 
 /* ================================================================== */
+section('12. 排查修复回归：错误透传 / 保留字 / 密匙保护 / 模型映射');
+
+{
+  // 1. 上游 4xx：真实错误信息要透传给客户端（此前被二次读体吞掉）
+  mockImpl = async () => jsonRes({ error: { message: 'model not found: xyz' } }, 400);
+  const r = await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi' });
+  const errBody = await r.json().catch(() => ({}));
+  check('上游 4xx 状态码透传', r.status === 400, r.status);
+  check('上游 4xx 错误信息透传（不再只剩「上游返回 400」）', /model not found/.test(errBody?.error?.message || ''), errBody?.error?.message);
+
+  // 2. 上游 5xx 重试耗尽：最后一个渠道的错误详情也带回
+  mockImpl = async () => jsonRes({ error: { message: 'server exploded' } }, 500);
+  const r2 = await post('/ark/v1/responses', { model: 'ep-20250101-abcdef', input: 'hi' });
+  const err2 = await r2.json().catch(() => ({}));
+  check('上游 5xx 耗尽时错误详情透传', r2.status === 500 && /server exploded/.test(err2?.error?.message || ''), err2?.error?.message);
+
+  // 3. 保留字 slug 被拒绝
+  const resv = await post('/_admin/api/channels', {
+    name: '保留字测试', slug: 'v1', baseUrl: 'https://a.example.com',
+  }, authHeaders());
+  const resvBody = await resv.json().catch(() => ({}));
+  check('保留字 slug（v1）被拒', (resv.status === 400 || resv.status === 500) && /保留字/.test(String(resvBody?.error || '')), resvBody?.error);
+  const resv2 = await post('/_admin/api/channels', {
+    name: '保留字测试2', slug: '_admin', baseUrl: 'https://a.example.com',
+  }, authHeaders());
+  check('保留字 slug（_admin）被拒', resv2.status !== 200, resv2.status);
+
+  // 4. /healthz/子路径 不再被健康检查吞掉
+  const hz = await post('/healthz/v1/responses', { model: 'x', input: 'hi' });
+  check('/healthz/子路径不再返回健康 JSON（应 404 渠道不存在）', hz.status === 404, hz.status);
+
+  // 5. 编辑渠道未重填 key：掩码值/空值不得覆盖已存真实 key
+  // maskKey('sk-deepseek-8888') === 'sk-dee****8888'，模拟面板回传掩码
+  const upd = await post('/_admin/api/channels', {
+    id: deepseekId,
+    name: 'DeepSeek 官方',
+    slug: 'deepseek',
+    baseUrl: 'https://api.deepseek.com',
+    apiKey: 'sk-dee****8888',
+    vendor: 'deepseek',
+    protocol: 'openai-chat',
+    models: ['deepseek-chat', 'deepseek-reasoner'],
+  }, authHeaders());
+  check('带掩码值更新渠道成功', upd.status === 200, upd.status);
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('ok'));
+  await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi' });
+  check('未重填 key 时真实密匙保留（上游仍收到原 key）',
+    captured[0]?.headers?.get('authorization') === 'Bearer sk-deepseek-8888',
+    captured[0]?.headers?.get('authorization'));
+
+  // 6. modelMapping：客户端模型名 → 上游模型名
+  const mapUpd = await post('/_admin/api/channels', {
+    id: deepseekId,
+    name: 'DeepSeek 官方',
+    slug: 'deepseek',
+    baseUrl: 'https://api.deepseek.com',
+    apiKey: 'sk-deepseek-8888',
+    vendor: 'deepseek',
+    protocol: 'openai-chat',
+    models: ['deepseek-chat', 'deepseek-reasoner'],
+    modelMapping: { 'gpt-4o': 'deepseek-chat' },
+  }, authHeaders());
+  check('配置模型映射成功', mapUpd.status === 200, mapUpd.status);
+
+  captured = [];
+  const mr = await post('/deepseek/v1/responses', { model: 'gpt-4o', input: 'hi' });
+  check('模型映射生效（上游收到映射后模型名）', captured[0]?.body?.model === 'deepseek-chat', captured[0]?.body?.model);
+  check('模型映射下客户端仍得 200', mr.status === 200, mr.status);
+}
+
+/* ================================================================== */
 console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m\n`);
 process.exit(failed === 0 ? 0 : 1);

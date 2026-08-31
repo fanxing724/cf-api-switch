@@ -122,16 +122,23 @@ export async function getChannelById(env, id) {
   return list.find((c) => c.id === id) || null;
 }
 
+/** 路由保留字：这些 slug 会与网关自身路径冲突，禁止用作渠道标识 */
+const RESERVED_SLUGS = new Set(['_admin', 'v1', 'v1beta', 'healthz']);
+
 export async function upsertChannel(env, input) {
   const list = await listChannels(env);
   const normalized = normalizeChannel(input);
 
   if (!normalized.slug) throw new Error('渠道标识（slug）不能为空，且只能包含小写字母、数字、连字符');
+  if (RESERVED_SLUGS.has(normalized.slug)) {
+    throw new Error(`渠道标识 "${normalized.slug}" 是系统保留字（_admin / v1 / v1beta / healthz），请换一个`);
+  }
   if (!normalized.baseUrl) throw new Error('上游地址不能为空');
 
   const idx = list.findIndex((c) => c.id === normalized.id);
   if (idx >= 0) {
     normalized.createdAt = list[idx].createdAt;
+    normalized.apiKey = preserveApiKey(list[idx], normalized.apiKey);
     list[idx] = normalized;
   } else {
     // 同 slug 已存在则视为更新。必须沿用原有 id，
@@ -140,6 +147,7 @@ export async function upsertChannel(env, input) {
     if (bySlug >= 0) {
       normalized.id = list[bySlug].id;
       normalized.createdAt = list[bySlug].createdAt;
+      normalized.apiKey = preserveApiKey(list[bySlug], normalized.apiKey);
       list[bySlug] = normalized;
     } else {
       list.push(normalized);
@@ -148,6 +156,18 @@ export async function upsertChannel(env, input) {
 
   await saveChannels(env, list);
   return normalized;
+}
+
+/**
+ * 更新渠道时保护已存密匙：
+ * 面板编辑不重填 key 的情况下，前端可能回传空值或列表里的掩码值
+ * （sk-xxx****xxxx），这两种都不能覆盖服务端已存的真实 key。
+ */
+function preserveApiKey(existing, incoming) {
+  if (!incoming) return existing.apiKey;
+  if (incoming === existing.apiKey) return existing.apiKey;
+  if (incoming === maskKey(existing.apiKey)) return existing.apiKey;
+  return incoming;
 }
 
 export async function deleteChannel(env, id) {

@@ -34,7 +34,7 @@ import { handleAdminApi, handleAdminUi } from './admin/index.js';
 const ADMIN_PREFIX = '_admin';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(env, request.headers.get('origin')) });
     }
@@ -48,8 +48,8 @@ export default {
       return segs[1] === 'api' ? handleAdminApi(request, env, segs.slice(2)) : handleAdminUi(request, env, url);
     }
 
-    // ---- 健康检查 -----------------------------------------------------
-    if (!segs.length || segs[0] === 'healthz') {
+    // ---- 健康检查（仅精确匹配 /healthz，不吞掉其他路径） -------------
+    if (!segs.length || (segs[0] === 'healthz' && segs.length === 1)) {
       return jsonResponse(
         {
           ok: true,
@@ -133,15 +133,22 @@ export default {
       const result = await dispatchToChannels(env, channels, internal);
 
       // ---- 记录渠道统计（失败也记）-----------------------------------
+      // 统计不阻塞响应：有执行上下文时挂到 waitUntil 后台执行；
+      // 没有时（本地测试环境）退化为同步等待，保证测试确定性。
+      const stat = async (info) => {
+        const p = recordRequest(env, result.channel?.id, info);
+        if (ctx?.waitUntil) ctx.waitUntil(p);
+        else await p;
+      };
       if (result.res) {
-        await recordRequest(env, result.channel?.id, {
+        await stat({
           ok: result.res.ok,
           status: result.res.status,
           model: internal.model,
           error: result.res.ok ? undefined : `HTTP ${result.res.status}`,
         });
       } else if (result.attempts?.length) {
-        await recordRequest(env, result.channel?.id, {
+        await stat({
           ok: false,
           status: 0,
           model: internal.model,
@@ -171,7 +178,8 @@ export default {
         );
       }
       if (!result.res.ok) {
-        const text = await result.res.text().catch(() => '');
+        // dispatch 已消费过响应体，这里优先用带回的 errorText（避免二次读取拿到空串）
+        const text = result.errorText || await result.res.text().catch(() => '');
         const parsedErr = safeJson(text, null);
         const message = parsedErr?.error?.message || parsedErr?.message || text.slice(0, 500) || `上游返回 ${result.res.status}`;
         return jsonError(message, parsedErr?.error?.type || 'upstream_error', result.res.status, inbound, headers);
@@ -294,7 +302,11 @@ async function handleModels(request, env, slug, baseHeaders) {
 
     const url = buildUpstreamUrl(channel, 'models', resolveApiVersion(channel));
     try {
-      const res = await fetch(url, { headers: buildHeaders(channel) });
+      // 模型列表是轻量 GET，固定 20s 超时，防止上游挂起吊死 Worker
+      const res = await fetch(url, {
+        headers: buildHeaders(channel),
+        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(20000) : undefined,
+      });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         return jsonResponse({ error: { message: `上游返回 ${res.status}: ${text.slice(0, 300)}`, type: 'upstream_error' } }, res.status, baseHeaders);

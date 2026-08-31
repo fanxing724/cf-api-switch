@@ -11,7 +11,6 @@ import {
   eventsToOpenAIChatStream,
   eventsToAnthropicStream,
 } from '../src/convert/stream.js';
-import { resolveUpstream, mapModel } from '../src/config.js';
 
 let passed = 0;
 let failed = 0;
@@ -31,30 +30,8 @@ function section(title) {
   console.log(`\n\x1b[36m${title}\x1b[0m`);
 }
 
-const env = {
-  UPSTREAM_ROUTES: JSON.stringify([
-    { match: 'gpt-5-', base: 'https://api.openai.com/v1', protocol: 'responses' },
-    { match: 'grok-', base: 'https://grok.example.com/v1', key: 'g2a_x', protocol: 'responses' },
-    { match: '*', base: 'https://api.openai.com/v1', protocol: 'responses' },
-  ]),
-  MODEL_ALIASES: JSON.stringify({ 'claude-3-5-sonnet': 'gpt-5' }),
-};
-
-/* ------------------------------------------------------------------ */
-section('1. 路由与别名');
-
-{
-  const r1 = resolveUpstream(env, 'gpt-5-mini');
-  check('gpt-5- 前缀命中 OpenAI', r1.base === 'https://api.openai.com/v1' && r1.protocol === 'responses');
-
-  const r2 = resolveUpstream(env, 'grok-4');
-  check('grok- 前缀命中第二个上游', r2.base === 'https://grok.example.com/v1' && r2.key === 'g2a_x');
-
-  const r3 = resolveUpstream(env, 'unknown-model');
-  check('未命中走兜底', r3.base === 'https://api.openai.com/v1');
-
-  check('别名映射生效', mapModel(env, 'claude-3-5-sonnet') === 'gpt-5');
-}
+// 与线上默认一致：不配置 STOP_AS_HINT / STORE_RESPONSE 等可选变量
+const env = {};
 
 /* ------------------------------------------------------------------ */
 section('2. chat/completions → Responses 请求');

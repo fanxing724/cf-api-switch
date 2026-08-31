@@ -104,10 +104,10 @@ export async function handleAdminApi(request, env, segs) {
       case 'channels': {
         if (request.method === 'GET') {
           const list = await listChannels(env);
-          const withStats = [];
-          for (const ch of list) {
-            withStats.push({ ...redact(ch), stats: await getStats(env, ch.id) });
-          }
+          // stats 逐渠道并行拉取，渠道多时面板不被串行 KV 读拖慢
+          const withStats = await Promise.all(
+            list.map(async (ch) => ({ ...redact(ch), stats: await getStats(env, ch.id) })),
+          );
           return jsonResponse({ channels: withStats }, 200, cors);
         }
         if (request.method === 'POST') {
@@ -254,7 +254,11 @@ async function testChannel(channel) {
 async function fetchUpstreamModels(channel) {
   const url = buildUpstreamUrl(channel, 'models', resolveApiVersion(channel));
   try {
-    const res = await fetch(url, { headers: buildHeaders(channel) });
+    // 轻量 GET，固定 20s 超时，防止上游挂起吊死面板请求
+    const res = await fetch(url, {
+      headers: buildHeaders(channel),
+      signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(20000) : undefined,
+    });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       return { ok: false, message: `上游返回 ${res.status}: ${text.slice(0, 200)}` };
@@ -263,7 +267,7 @@ async function fetchUpstreamModels(channel) {
     const ids = (json?.data || []).map((m) => m.id || m.name).filter(Boolean);
     return { ok: true, models: ids };
   } catch (err) {
-    return { ok: false, message: String(err?.message || err) };
+    return { ok: false, message: err?.name === 'TimeoutError' ? '拉取模型超时（20s）' : String(err?.message || err) };
   }
 }
 
