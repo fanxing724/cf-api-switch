@@ -674,5 +674,34 @@ section('10. probe 探测端点（不依赖已保存渠道）');
 }
 
 /* ================================================================== */
+section('11. 渠道请求统计');
+
+{
+  // 用相对断言：deepseek 渠道在前面用例里已被调用过，不能假设从 0 开始
+  const snap = async () => {
+    const r = await req('/_admin/api/channels', { headers: authHeaders() });
+    return (await r.json()).channels.find((c) => c.slug === 'deepseek')?.stats || {};
+  };
+  const before = await snap();
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('stats 测试'));
+  await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi' });
+  await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi2' });
+
+  const mid = await snap();
+  check('统计次数 +2', mid.count === (before.count || 0) + 2, { before, mid });
+  check('成功数 +2', mid.ok === (before.ok || 0) + 2);
+  check('统计记录最近模型', mid.lastModel === 'deepseek-chat');
+  check('统计记录最近状态码', mid.lastStatus === 200);
+
+  // 失败也记
+  mockImpl = async () => jsonRes({ error: { message: 'boom' } }, 500);
+  await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi3' });
+  const after = await snap();
+  check('失败计入统计', after.count === mid.count + 1 && after.fail === (mid.fail || 0) + 1, after);
+}
+
+/* ================================================================== */
 console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m\n`);
 process.exit(failed === 0 ? 0 : 1);

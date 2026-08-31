@@ -19,6 +19,7 @@ import {
 import { buildHeaders, buildRequest } from '../channels.js';
 import { VENDOR_LIST, resolveApiVersion } from '../vendors/index.js';
 import { createSession, verifySession, parseCookies, sessionCookie, clearCookie, setAdminPassword, COOKIE_NAME } from '../auth.js';
+import { getStats } from '../stats.js';
 import { jsonResponse } from '../util.js';
 
 const PUBLIC_ROUTES = new Set(['login', 'init', 'session']);
@@ -103,7 +104,11 @@ export async function handleAdminApi(request, env, segs) {
       case 'channels': {
         if (request.method === 'GET') {
           const list = await listChannels(env);
-          return jsonResponse({ channels: list.map(redact) }, 200, cors);
+          const withStats = [];
+          for (const ch of list) {
+            withStats.push({ ...redact(ch), stats: await getStats(env, ch.id) });
+          }
+          return jsonResponse({ channels: withStats }, 200, cors);
         }
         if (request.method === 'POST') {
           const body = await readJson(request);

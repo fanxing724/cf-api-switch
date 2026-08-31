@@ -28,6 +28,7 @@ import {
   anthropicMessageId,
 } from './convert/stream.js';
 import { corsHeaders, jsonResponse, sseHeaders, randomId, estimateTokens, safeJson } from './util.js';
+import { recordRequest } from './stats.js';
 import { handleAdminApi, handleAdminUi } from './admin/index.js';
 
 const ADMIN_PREFIX = '_admin';
@@ -125,6 +126,24 @@ export default {
 
       // ---- 打上游（带故障转移）----------------------------------------
       const result = await dispatchToChannels(env, channels, internal);
+
+      // ---- 记录渠道统计（失败也记）-----------------------------------
+      if (result.res) {
+        await recordRequest(env, result.channel?.id, {
+          ok: result.res.ok,
+          status: result.res.status,
+          model: internal.model,
+          error: result.res.ok ? undefined : `HTTP ${result.res.status}`,
+        });
+      } else if (result.attempts?.length) {
+        await recordRequest(env, result.channel?.id, {
+          ok: false,
+          status: 0,
+          model: internal.model,
+          error: result.attempts.map((a) => `${a.channel}: ${a.error}`).join('; ').slice(0, 200),
+        });
+      }
+
       const meta = {
         'X-Channel-Id': result.channel?.id || '',
         'X-Channel-Slug': result.channel?.slug || '',
