@@ -3,7 +3,7 @@
  */
 
 import { internalToResponses, internalToChat } from './convert/request.js';
-import { getVendor } from './vendors/index.js';
+import { getVendor, resolveApiVersion, applyDropParams } from './vendors/index.js';
 import { buildUpstreamUrl, getChannelsForModel } from './store.js';
 import { intEnv } from './config.js';
 
@@ -19,11 +19,14 @@ export function buildRequest(channel, internal) {
   const vendor = getVendor(channel.vendor);
 
   if (channel.protocol === 'responses') {
-    return { endpoint: 'responses', apiVersion: 'v1', payload: internalToResponses(ir, {}), protocol: 'responses' };
+    const apiVersion = channel.apiVersion === undefined || channel.apiVersion === null ? 'v1' : channel.apiVersion;
+    return { endpoint: 'responses', apiVersion, payload: internalToResponses(ir, {}), protocol: 'responses' };
   }
 
-  const payload = vendor.transformRequest(internalToChat(ir, {}));
-  return { endpoint: 'chat/completions', apiVersion: vendor.apiVersion, payload, protocol: 'openai-chat' };
+  // 厂商补丁 -> 渠道上手动声明的剔除项，后者优先级最高
+  let payload = vendor.transformRequest(internalToChat(ir, {}));
+  payload = applyDropParams(payload, channel);
+  return { endpoint: 'chat/completions', apiVersion: resolveApiVersion(channel), payload, protocol: 'openai-chat' };
 }
 
 /** 组装请求头 */

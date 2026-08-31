@@ -97,9 +97,35 @@ node scripts/e2e.mjs     # 面板鉴权 / 渠道 CRUD / 主链路 / 故障转移
 | `output[]{type:function_call}` | `message.tool_calls` | |
 | `usage.input_tokens` | `usage.prompt_tokens` | 含 `*_tokens_details` 回填 |
 
-## 厂商差异
+## 厂商：**自由填写**，预设仅供参考
 
-各家本质都是 OpenAI 兼容格式，差异点已收敛到 `src/vendors/`：
+面板里的「厂商」是个普通输入框，不是下拉枚举。填什么名字都行：
+
+- 填 `deepseek` / `ark` → 命中预设，自动应用对应的差异处理
+- 填 `zhipu` / `openrouter` / `随便起的名字` → 按通用 OpenAI 兼容转发，名字原样保存当备注用
+
+**所以适配一个没见过的新站点，不需要改代码。** 直接在面板上填，然后用「高级」里的三项兜底：
+
+| 高级字段 | 用途 | 什么时候用 |
+| --- | --- | --- |
+| **URL 版本段** | 拼在地址与端点之间那段，默认 `v1` | 上游用 `v1beta` 之类的就改它 |
+| **地址已含版本号** | 勾选后不再拼任何版本段 | 火山方舟（`/api/v3`）、把版本号写进地址的中转站 |
+| **剔除参数** | 逗号分隔，发送前从请求体删掉 | 上游不认 `user` / `stream_options` / `logit_bias` 之类 |
+| **自定义请求头** | JSON 对象，追加到上游请求 | 上游走 `x-api-key` 而不是 `Authorization: Bearer` |
+
+举例，接一个地址是 `https://my.example.com/api/v9`、不认 `user` 字段、靠 `x-api-key` 鉴权的站：
+
+```
+厂商：随便填
+上游地址：https://my.example.com/api/v9
+☑ 地址已含版本号
+剔除参数：user
+自定义请求头：{"x-api-key": "xxx"}
+```
+
+### 预设厂商的差异处理
+
+差异点收敛在 `src/vendors/index.js`，想固化某个厂商的行为就往里加一个对象：
 
 | 厂商 | 差异处理 |
 | --- | --- |
@@ -107,7 +133,7 @@ node scripts/e2e.mjs     # 面板鉴权 / 渠道 CRUD / 主链路 / 故障转移
 | **DeepSeek** | R1 系列不向上游传 `temperature` / `top_p`（官方建议）；剔除 `logit_bias`、`n`；响应的 `reasoning_content` 映射成新协议的 reasoning 项 |
 | **火山方舟** | URL 版本号写在 base 里（`/api/v3`），不重复拼 `/v1`；剔除 `logit_bias`、`user`；模型名填控制台的接入点 ID（`ep-xxxx`） |
 
-新增厂商只需在 `src/vendors/index.js` 加一个对象，实现 `transformRequest` 与 `apiVersion` 即可。
+渠道上手动填的「剔除参数」优先级最高，会覆盖厂商预设的行为。
 
 ## 管理面板
 

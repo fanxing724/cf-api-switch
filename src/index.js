@@ -16,7 +16,7 @@
 
 import { getSettings, listAllModels, buildUpstreamUrl, getChannelBySlug } from './store.js';
 import { resolveChannels, dispatchToChannels, buildHeaders } from './channels.js';
-import { getVendor } from './vendors/index.js';
+import { resolveApiVersion } from './vendors/index.js';
 import { chatToInternal, anthropicToInternal, responsesToInternal } from './convert/request.js';
 import { responsesToChat, responsesToAnthropic, chatObjectToResponses, chatToChat, chatToAnthropic } from './convert/response.js';
 import {
@@ -268,8 +268,7 @@ async function handleModels(request, env, slug, baseHeaders) {
     if (!channel) return jsonResponse({ error: { message: `渠道 "${slug}" 不存在`, type: 'invalid_request_error' } }, 404, baseHeaders);
     if (!channel.enabled) return jsonResponse({ error: { message: `渠道 "${slug}" 已停用`, type: 'invalid_request_error' } }, 403, baseHeaders);
 
-    const vendor = getVendor(channel.vendor);
-    const url = buildUpstreamUrl(channel, 'models', vendor.apiVersion);
+    const url = buildUpstreamUrl(channel, 'models', resolveApiVersion(channel));
     try {
       const res = await fetch(url, { headers: buildHeaders(channel) });
       if (!res.ok) {

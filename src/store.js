@@ -60,7 +60,15 @@ function normalizeChannel(input) {
     baseUrl,
     apiKey: input.apiKey ?? '',
     protocol: input.protocol === 'responses' ? 'responses' : 'openai-chat',
-    vendor: ['deepseek', 'ark', 'generic'].includes(input.vendor) ? input.vendor : 'generic',
+    // 厂商可自由填写：预设值只是建议，未知的按通用 OpenAI 兼容处理
+    vendor: String(input.vendor || 'generic').trim() || 'generic',
+    // null/undefined 表示「跟随厂商默认」，空字符串表示「不插版本段」
+    apiVersion: input.apiVersion === undefined || input.apiVersion === null ? undefined : String(input.apiVersion).trim(),
+    dropParams: Array.isArray(input.dropParams)
+      ? input.dropParams.map((p) => String(p).trim()).filter(Boolean)
+      : typeof input.dropParams === 'string'
+        ? input.dropParams.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
     models: Array.isArray(input.models) ? input.models.filter(Boolean) : [],
     enabled: input.enabled !== false,
     weight: Number.isFinite(Number(input.weight)) ? Number(input.weight) : 100,

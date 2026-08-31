@@ -534,5 +534,102 @@ section('8. 模型列表与错误处理');
 }
 
 /* ================================================================== */
+section('9. 自定义厂商（厂商可自由填写）');
+
+{
+  const res = await req('/_admin/api/vendors', { headers: authHeaders() });
+  const out = await res.json();
+  check('vendors 接口返回预设建议', out.vendors?.some((v) => v.name === 'deepseek'), out.vendors?.map((v) => v.name));
+}
+
+{
+  // 填一个预设里没有的厂商名，应当照样能用（按通用 OpenAI 兼容处理）
+  const res = await post('/_admin/api/channels', {
+    name: '智谱 GLM',
+    slug: 'zhipu',
+    baseUrl: 'https://open.bigmodel.cn/api/paas',
+    apiKey: 'zhipu-key',
+    vendor: 'zhipu',
+    protocol: 'openai-chat',
+    models: ['glm-4.6'],
+  }, authHeaders());
+  const out = await res.json();
+  check('自定义厂商可创建', res.status === 200 && out.channel?.vendor === 'zhipu', out);
+  check('未走枚举兜底（保留原名）', out.channel?.vendor !== 'generic', out.channel?.vendor);
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('智谱回复'));
+  const r = await post('/zhipu/v1/responses', { model: 'glm-4.6', input: 'hi' });
+  const body = await r.json();
+  check('自定义厂商按通用格式转发', captured[0].url === 'https://open.bigmodel.cn/api/paas/v1/chat/completions', captured[0].url);
+  check('自定义厂商响应正常', body.output?.[0]?.content?.[0]?.text === '智谱回复');
+}
+
+{
+  // 版本段自己指定：填 v1beta
+  await post('/_admin/api/channels', {
+    name: '自定义版本段', slug: 'beta', baseUrl: 'https://beta.example.com', apiKey: 'k',
+    vendor: 'openrouter', apiVersion: 'v1beta', models: ['m1'],
+  }, authHeaders());
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('beta 回复'));
+  await post('/beta/v1/responses', { model: 'm1', input: 'hi' });
+  check('自定义版本段生效', captured[0].url === 'https://beta.example.com/v1beta/chat/completions', captured[0].url);
+}
+
+{
+  // 版本段留空：不插任何版本段（等价于方舟行为，但用自定义厂商实现）
+  await post('/_admin/api/channels', {
+    name: '无版本段', slug: 'nover', baseUrl: 'https://nov.example.com/api/v9', apiKey: 'k',
+    vendor: 'somevendor', apiVersion: '', models: ['m2'],
+  }, authHeaders());
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('无版本段回复'));
+  await post('/nover/v1/responses', { model: 'm2', input: 'hi' });
+  check('apiVersion 为空时不插版本段', captured[0].url === 'https://nov.example.com/api/v9/chat/completions', captured[0].url);
+}
+
+{
+  // 剔除参数
+  await post('/_admin/api/channels', {
+    name: '剔参数', slug: 'drop', baseUrl: 'https://drop.example.com', apiKey: 'k',
+    vendor: 'generic', dropParams: ['user', 'max_tokens', 'temperature'], models: ['m3'],
+  }, authHeaders());
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('剔除后回复'));
+  await post('/drop/v1/responses', { model: 'm3', input: 'hi', temperature: 0.5, max_output_tokens: 99, user: 'u1' });
+  const sent = captured[0].body;
+  check('dropParams 剔掉 temperature', sent.temperature === undefined, sent);
+  check('dropParams 剔掉 max_tokens', sent.max_tokens === undefined);
+  check('dropParams 剔掉 user', sent.user === undefined);
+  check('未声明的字段不受影响', sent.messages?.length === 1);
+}
+
+{
+  // 自定义请求头
+  await post('/_admin/api/channels', {
+    name: '自定义头', slug: 'hdr', baseUrl: 'https://hdr.example.com', apiKey: 'bearer-key',
+    vendor: 'generic', headers: { 'x-api-key': 'custom-header-value' }, models: ['m4'],
+  }, authHeaders());
+
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('带自定义头'));
+  await post('/hdr/v1/responses', { model: 'm4', input: 'hi' });
+  check('自定义请求头生效', captured[0].headers.get('x-api-key') === 'custom-header-value', captured[0].headers.get('x-api-key'));
+  check('Bearer 鉴权仍在', captured[0].headers.get('authorization') === 'Bearer bearer-key');
+}
+
+{
+  // 预设厂商仍走各自的差异逻辑
+  captured = [];
+  mockImpl = async () => jsonRes(chatResponse('ok'));
+  await post('/deepseek/v1/responses', { model: 'deepseek-reasoner', input: 'hi', temperature: 0.3 });
+  check('预设厂商 deepseek 的差异仍生效', captured[0].body.temperature === undefined, captured[0].body);
+}
+
+/* ================================================================== */
 console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m\n`);
 process.exit(failed === 0 ? 0 : 1);

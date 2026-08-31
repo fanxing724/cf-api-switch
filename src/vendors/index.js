@@ -70,13 +70,35 @@ const ark = {
 
 const REGISTRY = { generic, deepseek, ark };
 
+/**
+ * 取厂商适配器。未知厂商一律按通用 OpenAI 兼容处理——
+ * 面板里厂商是自由填写的，用户填 `zhipu` / `openrouter` 之类的名字
+ * 也能直接跑，差异再用渠道上的「版本段 / 剔除参数」两项兜底。
+ */
 export function getVendor(name) {
-  return REGISTRY[name] || generic;
+  const key = String(name || '').trim().toLowerCase();
+  return REGISTRY[key] || generic;
 }
 
+/** 已知厂商列表，只作为面板的输入建议，不构成限制 */
 export const VENDOR_LIST = Object.values(REGISTRY).map(({ name, label, hint, basePlaceholder }) => ({
   name,
   label,
   hint,
   basePlaceholder,
 }));
+
+/** 版本段：渠道上显式配了就用渠道的，否则用厂商默认 */
+export function resolveApiVersion(channel) {
+  return channel.apiVersion === undefined || channel.apiVersion === null
+    ? getVendor(channel.vendor).apiVersion
+    : channel.apiVersion;
+}
+
+/** 剔除渠道上声明的参数（在厂商 transform 之后执行，优先级最高） */
+export function applyDropParams(payload, channel) {
+  if (!channel.dropParams?.length) return payload;
+  const out = { ...payload };
+  for (const key of channel.dropParams) delete out[key];
+  return out;
+}

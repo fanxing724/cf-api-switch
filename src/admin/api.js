@@ -16,7 +16,7 @@ import {
   buildUpstreamUrl,
 } from '../store.js';
 import { buildHeaders, buildRequest } from '../channels.js';
-import { getVendor, VENDOR_LIST } from '../vendors/index.js';
+import { VENDOR_LIST, resolveApiVersion } from '../vendors/index.js';
 import { createSession, verifySession, parseCookies, sessionCookie, clearCookie, setAdminPassword, COOKIE_NAME } from '../auth.js';
 import { jsonResponse } from '../util.js';
 
@@ -175,8 +175,7 @@ async function readJson(request) {
 
 /** 连通性测试：发一个极短的真实请求，看上游是否认这个 key */
 async function testChannel(channel) {
-  const vendor = getVendor(channel.vendor);
-  const url = buildUpstreamUrl(channel, 'chat/completions', vendor.apiVersion);
+  const url = buildUpstreamUrl(channel, 'chat/completions', resolveApiVersion(channel));
   const started = Date.now();
 
   // 没填模型就用一个通用名字，多数站点会因模型不存在返回 400/404——
@@ -224,8 +223,7 @@ async function testChannel(channel) {
 
 /** 拉取上游真实模型列表，面板上一键回填 */
 async function fetchUpstreamModels(channel) {
-  const vendor = getVendor(channel.vendor);
-  const url = buildUpstreamUrl(channel, 'models', vendor.apiVersion);
+  const url = buildUpstreamUrl(channel, 'models', resolveApiVersion(channel));
   try {
     const res = await fetch(url, { headers: buildHeaders(channel) });
     if (!res.ok) {
