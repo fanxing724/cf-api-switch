@@ -1,534 +1,296 @@
 /**
- * openai-protocol-bridge
+ * cf-api-switch — 多渠道协议转换网关
  *
- * Cloudflare Worker：把旧的长青协议「翻译」成 OpenAI 新 Responses 协议。
+ * 对外统一暴露 OpenAI 新协议（Responses），也接受旧 chat 协议与 Anthropic 协议；
+ * 后端按渠道把请求翻译成各家自己的格式打过去，再把响应翻译回来。
  *
- *   入站                       出站（可路由到多个上游）
- *   POST /v1/chat/completions  ->  POST {upstream}/responses
- *   POST /v1/messages          ->  POST {upstream}/responses
- *   POST /v1/responses         ->  POST {upstream}/responses （原生透传）
+ * 路由规则：
+ *   /<渠道名>/v1/<端点>     指定渠道
+ *   /v1/<端点>             按模型自动选渠道
+ *   /_admin                管理面板
  *
- * 上游若只支持旧协议（route.protocol = "chat"），会自动改打 /chat/completions。
+ * 例：
+ *   你的域名/deepseek/v1/responses        -> DeepSeek 的 chat 接口
+ *   你的域名/ark/v1/chat/completions      -> 火山方舟的 chat 接口
  */
 
-import { mapModel, resolveUpstream, authorizeClient, boolEnv, intEnv } from './config.js';
-import { chatToInternal, anthropicToInternal, internalToResponses, internalToChat } from './convert/request.js';
-import { responsesToChat, responsesToAnthropic, chatToChat, chatToAnthropic } from './convert/response.js';
+import { getSettings, listAllModels, buildUpstreamUrl, getChannelBySlug } from './store.js';
+import { resolveChannels, dispatchToChannels, buildHeaders } from './channels.js';
+import { getVendor } from './vendors/index.js';
+import { chatToInternal, anthropicToInternal, responsesToInternal } from './convert/request.js';
+import { responsesToChat, responsesToAnthropic, chatObjectToResponses, chatToChat, chatToAnthropic } from './convert/response.js';
 import {
   responsesStreamToEvents,
   chatStreamToEvents,
+  eventsToResponsesStream,
   eventsToOpenAIChatStream,
   eventsToAnthropicStream,
   anthropicMessageId,
 } from './convert/stream.js';
-import { corsHeaders, jsonResponse, errorResponse, sseHeaders, randomId, estimateTokens, extractClientKey, safeJson } from './util.js';
+import { corsHeaders, jsonResponse, sseHeaders, randomId, estimateTokens, safeJson } from './util.js';
+import { handleAdminApi, handleAdminUi } from './admin/index.js';
+
+const ADMIN_PREFIX = '_admin';
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // ---- CORS 预检 -----------------------------------------------------
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(env, request.headers.get('origin')) });
     }
 
+    const url = new URL(request.url);
+    const segs = url.pathname.split('/').filter(Boolean);
     const baseHeaders = corsHeaders(env, request.headers.get('origin'));
 
+    // ---- 管理面板 -----------------------------------------------------
+    if (segs[0] === ADMIN_PREFIX) {
+      return segs[1] === 'api' ? handleAdminApi(request, env, segs.slice(2)) : handleAdminUi(request, env, url);
+    }
+
     // ---- 健康检查 -----------------------------------------------------
-    if (path === '/' || path === '/healthz' || path === '/health') {
+    if (!segs.length || segs[0] === 'healthz') {
       return jsonResponse(
         {
           ok: true,
-          service: 'openai-protocol-bridge',
-          version: '1.0.0',
-          endpoints: {
-            'POST /v1/chat/completions': 'OpenAI 兼容旧协议入口 -> 新 Responses 协议',
-            'POST /v1/messages': 'Anthropic Messages 入口 -> 新 Responses 协议',
-            'POST /v1/responses': '新协议原生入口（透传 / 按上游降级）',
-            'POST /v1/messages/count_tokens': 'Anthropic token 计数（估算）',
-            'GET /v1/models': '模型列表透传',
-          },
+          service: 'cf-api-switch',
+          version: '2.0.0',
+          usage: '把 /<渠道名>/v1/responses 打到网关，网关翻译成该渠道的原生格式',
+          admin: '/_admin',
         },
         200,
         baseHeaders,
       );
     }
 
-    // ---- 鉴权 ---------------------------------------------------------
-    const auth = authorizeClient(env, request);
-    if (!auth.ok) return errorResponse(auth.message, auth.status, 'invalid_request_error', baseHeaders);
-
-    if (request.method !== 'POST' && request.method !== 'GET') {
-      return errorResponse('Method not allowed', 405, 'invalid_request_error', baseHeaders);
-    }
-
     try {
-      if (path === '/v1/models' && request.method === 'GET') return handleModels(request, env, baseHeaders);
-      if (path === '/v1/messages/count_tokens' && request.method === 'POST') return handleCountTokens(request, env, baseHeaders);
-      if (path === '/v1/chat/completions') return handleChat(request, env, baseHeaders);
-      if (path === '/v1/messages') return handleAnthropic(request, env, baseHeaders);
-      if (path === '/v1/responses') return handleResponses(request, env, baseHeaders);
-      if (path === '/v1/completions') {
-        return errorResponse('/v1/completions（文本补全）已被 OpenAI 废弃，请改用 /v1/chat/completions 或 /v1/messages 入口。', 400, 'invalid_request_error', baseHeaders);
+      // ---- 解析路径：<slug>/v1/<endpoint> ------------------------------
+      const route = parseRoute(segs);
+      if (route.error) return jsonResponse({ error: { message: route.error, type: 'invalid_request_error' } }, 404, baseHeaders);
+
+      const { slug, endpoint } = route;
+
+      // ---- 模型列表 ---------------------------------------------------
+      if (request.method === 'GET' && endpoint === 'models') {
+        return handleModels(request, env, slug, baseHeaders);
       }
-      return errorResponse(`未知路由: ${path}`, 404, 'invalid_request_error', baseHeaders);
+
+      if (request.method !== 'POST') {
+        return jsonError('只支持 POST 请求', 'invalid_request_error', 405, 'chat', baseHeaders);
+      }
+
+      // ---- 客户端鉴权 -------------------------------------------------
+      const settings = await getSettings(env);
+      if (settings.requireAuth && settings.clientKeys.length) {
+        const key = extractKey(request);
+        if (!settings.clientKeys.includes(key)) {
+          return jsonError('Invalid API key', 'invalid_request_error', 401, inferInbound(endpoint), baseHeaders);
+        }
+      }
+
+      const body = await readJsonBody(request);
+      if (!body) return jsonError('请求体必须是合法 JSON', 'invalid_request_error', 400, inferInbound(endpoint), baseHeaders);
+
+      const inbound = inferInbound(endpoint);
+      if (!inbound) {
+        return jsonError(`不支持的端点: ${endpoint}`, 'invalid_request_error', 404, 'chat', baseHeaders);
+      }
+
+      // ---- Anthropic 的 token 计数：本地估算，不打扰上游 ---------------
+      if (endpoint === 'messages/count_tokens') {
+        const { internal } = anthropicToInternal(body);
+        let text = internal.instructions || '';
+        for (const item of internal.input || []) {
+          if (item.type === 'message') for (const c of item.content || []) if (c?.text) text += c.text;
+          else if (item.type === 'function_call') text += `${item.name}${item.arguments ?? ''}`;
+          else if (item.type === 'function_call_output') text += item.output ?? '';
+        }
+        for (const t of internal.tools || []) text += `${t.name}${t.description ?? ''}${JSON.stringify(t.parameters ?? {})}`;
+        return jsonResponse({ input_tokens: estimateTokens(text) }, 200, baseHeaders);
+      }
+
+      // ---- 入站 -> internal -------------------------------------------
+      const parsed = parseInbound(inbound, body);
+      if (parsed.error) return jsonError(parsed.error, 'invalid_request_error', 400, inbound, baseHeaders);
+
+      const internal = parsed.internal;
+      const warnings = parsed.warnings || [];
+
+      if (!internal.model) {
+        return jsonError('请求缺少 model 字段，无法选择渠道', 'invalid_request_error', 400, inbound, baseHeaders);
+      }
+
+      // ---- 选渠道 -----------------------------------------------------
+      const { channels, error: routeError, status } = await resolveChannels(env, { slug, model: internal.model });
+      if (routeError) return jsonError(routeError, 'invalid_request_error', status || 404, inbound, baseHeaders);
+
+      // ---- 打上游（带故障转移）----------------------------------------
+      const result = await dispatchToChannels(env, channels, internal);
+      const meta = {
+        'X-Channel-Id': result.channel?.id || '',
+        'X-Channel-Slug': result.channel?.slug || '',
+        'X-Upstream-Base': result.channel?.baseUrl || '',
+        'X-Upstream-Protocol': result.protocol || '',
+        'X-Upstream-Model': result.payload?.model || internal.model,
+        'X-Upstream-Url': result.url || '',
+      };
+      if (result.attempts?.length) meta['X-Fallback-Attempts'] = String(result.attempts.length);
+      if (warnings.length) meta['X-Bridge-Warnings'] = encodeURIComponent(warnings.join(' | '));
+      const headers = { ...baseHeaders, ...meta };
+
+      if (!result.res) {
+        return jsonError(
+          `所有渠道均调用失败：${result.attempts.map((a) => `${a.channel}(${a.error})`).join('; ')}`,
+          'upstream_error',
+          502,
+          inbound,
+          headers,
+        );
+      }
+      if (!result.res.ok) {
+        const text = await result.res.text().catch(() => '');
+        const parsedErr = safeJson(text, null);
+        const message = parsedErr?.error?.message || parsedErr?.message || text.slice(0, 500) || `上游返回 ${result.res.status}`;
+        return jsonError(message, parsedErr?.error?.type || 'upstream_error', result.res.status, inbound, headers);
+      }
+
+      // ---- 渲染响应 ---------------------------------------------------
+      if (internal.stream) {
+        return renderStream(result, { inbound, headers, model: internal.model });
+      }
+
+      const json = await result.res.json().catch(() => null);
+      if (!json) return jsonError('上游返回了无法解析的响应', 'upstream_error', 502, inbound, headers);
+
+      const out = renderObject(json, inbound, result.protocol, internal.model);
+      if (out?.error) {
+        return jsonError(out.error.message || '上游返回错误', out.error.type || 'upstream_error', 502, inbound, headers);
+      }
+      return jsonResponse(out, 200, headers);
     } catch (err) {
-      return errorResponse(`网关内部错误: ${err?.message || err}`, 500, 'bridge_error', baseHeaders);
+      return jsonError(`网关内部错误: ${err?.message || err}`, 'bridge_error', 500, 'chat', baseHeaders);
     }
   },
 };
 
 /* ------------------------------------------------------------------ */
-/* 通用：请求上游                                                       */
+/* 路径解析                                                            */
 /* ------------------------------------------------------------------ */
 
-async function callUpstream(env, upstream, endpoint, payload, extraWarnings = []) {
-  const target = `${upstream.base}/${endpoint}`;
-  const timeout = intEnv(env?.UPSTREAM_TIMEOUT_MS, 600000);
-
-  const headers = new Headers({ 'content-type': 'application/json' });
-  if (upstream.key) headers.set('authorization', `Bearer ${upstream.key}`);
-  if (upstream.headers) {
-    for (const [k, v] of Object.entries(upstream.headers)) headers.set(k, v);
+function parseRoute(segs) {
+  // /v1/<endpoint>
+  if (segs[0] === 'v1' || segs[0] === 'v1beta') {
+    const endpoint = segs.slice(1).join('/');
+    return endpoint ? { slug: null, endpoint } : { error: '缺少端点' };
   }
-
-  const res = await fetch(target, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(timeout) : undefined,
-  });
-
-  const metaHeaders = {
-    'X-Upstream-Base': upstream.base,
-    'X-Upstream-Protocol': upstream.protocol,
-    'X-Upstream-Model': String(payload.model ?? ''),
-  };
-  if (extraWarnings.length) {
-    metaHeaders['X-Bridge-Warnings'] = encodeURIComponent(extraWarnings.join(' | '));
+  // /<slug>/v1/<endpoint>
+  if (segs[1] === 'v1' || segs[1] === 'v1beta') {
+    const endpoint = segs.slice(2).join('/');
+    return endpoint ? { slug: segs[0].toLowerCase(), endpoint } : { error: '缺少端点' };
   }
-
-  return { res, metaHeaders, target };
+  return { error: `路径格式应为 /<渠道名>/v1/<端点>，收到的是 /${segs.join('/')}` };
 }
 
-/** 上游报错时，按目标协议封装错误体 */
-async function relayUpstreamError(res, target) {
-  const text = await res.text().catch(() => '');
-  const parsed = safeJson(text, null);
-  const message =
-    parsed?.error?.message || parsed?.message || text?.slice(0, 2000) || `上游返回 ${res.status}`;
-  return { status: res.status, message: `上游 ${res.status} · ${message}`, type: parsed?.error?.type || 'upstream_error', target };
-}
-
-function protocolError(message, status, type, extraHeaders, target = 'openai') {
-  if (target === 'anthropic') {
-    return jsonResponse(
-      { type: 'error', error: { type: type === 'invalid_api_key' ? 'authentication_error' : 'api_error', message } },
-      status,
-      extraHeaders,
-    );
-  }
-  return errorResponse(message, status, type, extraHeaders);
+/** 端点 -> 入站协议 */
+function inferInbound(endpoint) {
+  if (endpoint === 'responses') return 'responses';
+  if (endpoint === 'chat/completions' || endpoint === 'completions') return 'chat';
+  if (endpoint === 'messages' || endpoint === 'messages/count_tokens') return 'anthropic';
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
-/* 入口 1：/v1/chat/completions                                         */
+/* 入站解析                                                            */
 /* ------------------------------------------------------------------ */
 
-async function handleChat(request, env, baseHeaders) {
-  const body = await readJsonBody(request);
-  if (!body) return errorResponse('请求体必须是合法 JSON', 400, 'invalid_request_error', baseHeaders);
-  if (!Array.isArray(body.messages)) {
-    return errorResponse('缺少 messages 字段', 400, 'invalid_request_error', baseHeaders);
-  }
-
-  const clientModel = body.model || 'gpt-5';
-  const model = mapModel(env, clientModel);
-  const upstream = resolveUpstream(env, model);
-  const warnings = [];
-
-  // 上游只支持旧协议：直接透传，避免无谓的来回转换损失字段
-  const payload =
-    upstream.protocol === 'chat'
-      ? { ...body, model }
-      : (() => {
-          const { internal, warnings: w } = chatToInternal({ ...body, model });
-          warnings.push(...w);
-          return internalToResponses(internal, env);
-        })();
-
-  const stream = !!body.stream;
-  const { res, metaHeaders } = await callUpstream(
-    env,
-    upstream,
-    upstream.protocol === 'chat' ? 'chat/completions' : 'responses',
-    payload,
-    warnings,
-  );
-
-  const headers = { ...baseHeaders, ...metaHeaders };
-  if (!res.ok) {
-    const err = await relayUpstreamError(res);
-    return protocolError(err.message, err.status, err.type, headers);
-  }
-
-  if (stream) {
-    const id = randomId('chatcmpl');
-    const includeUsage = boolEnv(env?.ALWAYS_INCLUDE_USAGE, true) || body.stream_options?.include_usage === true;
-    const events = upstream.protocol === 'chat' ? chatStreamToEvents(res.body) : responsesStreamToEvents(res.body);
-    const out = eventsToOpenAIChatStream(events, {
-      id,
-      created: Math.floor(Date.now() / 1000),
-      model: clientModel,
-      includeUsage,
-    });
-    return new Response(out, { status: 200, headers: sseHeaders(headers) });
-  }
-
-  const json = await res.json().catch(() => null);
-  if (!json) return errorResponse('上游返回了无法解析的响应', 502, 'upstream_error', headers);
-
-  const converted = upstream.protocol === 'chat' ? chatToChat(json, clientModel) : responsesToChat(json, clientModel);
-  if (converted.error) {
-    return errorResponse(converted.error.message || '上游返回错误', 502, converted.error.type || 'upstream_error', headers);
-  }
-  return jsonResponse(converted, 200, headers);
-}
-
-/* ------------------------------------------------------------------ */
-/* 入口 2：/v1/messages（Anthropic）                                    */
-/* ------------------------------------------------------------------ */
-
-async function handleAnthropic(request, env, baseHeaders) {
-  const body = await readJsonBody(request);
-  if (!body) return protocolError('请求体必须是合法 JSON', 400, 'invalid_request_error', baseHeaders, 'anthropic');
-  if (!Array.isArray(body.messages)) {
-    return protocolError('缺少 messages 字段', 400, 'invalid_request_error', baseHeaders, 'anthropic');
-  }
-
-  const clientModel = body.model || 'gpt-5';
-  const model = mapModel(env, clientModel);
-  const upstream = resolveUpstream(env, model);
-
-  const { internal, warnings } = anthropicToInternal({ ...body, model });
-  if (internal.maxOutputTokens === undefined) internal.maxOutputTokens = 4096;
-
-  const payload = upstream.protocol === 'chat' ? internalToChat(internal, env) : internalToResponses(internal, env);
-
-  const stream = !!body.stream;
-  const { res, metaHeaders } = await callUpstream(
-    env,
-    upstream,
-    upstream.protocol === 'chat' ? 'chat/completions' : 'responses',
-    payload,
-    warnings,
-  );
-
-  const headers = { ...baseHeaders, ...metaHeaders };
-  if (!res.ok) {
-    const err = await relayUpstreamError(res);
-    return protocolError(err.message, err.status, err.type, headers, 'anthropic');
-  }
-
-  if (stream) {
-    const id = anthropicMessageId();
-    const events = upstream.protocol === 'chat' ? chatStreamToEvents(res.body) : responsesStreamToEvents(res.body);
-    const out = eventsToAnthropicStream(events, { id, model: clientModel, includeUsage: true });
-    return new Response(out, { status: 200, headers: sseHeaders(headers) });
-  }
-
-  const json = await res.json().catch(() => null);
-  if (!json) return protocolError('上游返回了无法解析的响应', 502, 'upstream_error', headers, 'anthropic');
-
-  const converted = upstream.protocol === 'chat' ? chatToAnthropic(json, clientModel) : responsesToAnthropic(json, clientModel);
-  if (converted.error) {
-    return protocolError(converted.error.message || '上游返回错误', 502, converted.error.type || 'upstream_error', headers, 'anthropic');
-  }
-  return jsonResponse(converted, 200, headers);
-}
-
-/* ------------------------------------------------------------------ */
-/* 入口 3：/v1/responses（新协议原生入口）                              */
-/* ------------------------------------------------------------------ */
-
-async function handleResponses(request, env, baseHeaders) {
-  const body = await readJsonBody(request);
-  if (!body) return errorResponse('请求体必须是合法 JSON', 400, 'invalid_request_error', baseHeaders);
-
-  const model = mapModel(env, body.model || 'gpt-5');
-  const upstream = resolveUpstream(env, model);
-
-  // 上游不支持新协议时，降级为 chat/completions
-  let payload = { ...body, model };
-  let endpoint = 'responses';
-  if (upstream.protocol === 'chat') {
-    const { internal } = chatToInternal(responsesBodyToChatShape(body, model));
-    payload = internalToChat(internal, env);
-    endpoint = 'chat/completions';
-  }
-
-  const { res, metaHeaders } = await callUpstream(env, upstream, endpoint, payload, []);
-  const headers = { ...baseHeaders, ...metaHeaders };
-
-  if (!res.ok) {
-    const err = await relayUpstreamError(res);
-    return errorResponse(err.message, err.status, err.type, headers);
-  }
-
-  // 降级场景下把 chat 响应还原成 Responses 形状，保证客户端拿到一致结构
-  if (upstream.protocol === 'chat') {
-    if (body.stream) {
-      const events = chatStreamToEvents(res.body);
-      // 客户端要的是 Responses 事件流，这里直接把上游 chat 流转成 responses 事件
-      const out = chatEventsToResponsesStream(events, model);
-      return new Response(out, { status: 200, headers: sseHeaders(headers) });
+function parseInbound(inbound, body) {
+  if (inbound === 'responses') {
+    if (body.input === undefined && !body.instructions && !body.previous_response_id) {
+      return { error: 'Responses 请求缺少 input 字段' };
     }
-    const json = await res.json().catch(() => null);
-    if (!json) return errorResponse('上游返回了无法解析的响应', 502, 'upstream_error', headers);
-    return jsonResponse(chatObjectToResponses(json, model), 200, headers);
+    return responsesToInternal(body);
   }
-
-  if (body.stream) {
-    return new Response(res.body, { status: 200, headers: sseHeaders(headers) });
+  if (inbound === 'anthropic') {
+    if (!Array.isArray(body.messages)) return { error: '缺少 messages 字段' };
+    return anthropicToInternal(body);
   }
-  const json = await res.json().catch(() => null);
-  return jsonResponse(json ?? {}, 200, headers);
+  if (!Array.isArray(body.messages)) return { error: '缺少 messages 字段' };
+  return chatToInternal(body);
 }
 
-/** Responses 请求体 -> chat 请求体形状（降级路径复用 chatToInternal） */
-function responsesBodyToChatShape(body, model) {
-  const messages = [];
-  if (body.instructions) messages.push({ role: 'system', content: body.instructions });
+/* ------------------------------------------------------------------ */
+/* 响应渲染                                                            */
+/* ------------------------------------------------------------------ */
 
-  const items = Array.isArray(body.input) ? body.input : typeof body.input === 'string' ? [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: body.input }] }] : [];
+/** 非流式：上游协议 × 入站协议 -> 目标对象 */
+function renderObject(json, inbound, upstreamProtocol, model) {
+  if (upstreamProtocol === 'responses') {
+    if (inbound === 'responses') return json; // 双端都是新协议，原样透传
+    return inbound === 'chat' ? responsesToChat(json, model) : responsesToAnthropic(json, model);
+  }
+  // 上游是老 chat 协议
+  if (inbound === 'responses') return chatObjectToResponses(json, model);
+  if (inbound === 'chat') return chatToChat(json, model);
+  return chatToAnthropic(json, model);
+}
 
-  let pendingAssistant = null;
-  const flush = () => {
-    if (pendingAssistant) {
-      const m = { role: 'assistant', content: pendingAssistant.text || null };
-      if (pendingAssistant.toolCalls.length) m.tool_calls = pendingAssistant.toolCalls;
-      messages.push(m);
-      pendingAssistant = null;
-    }
+/** 流式：按入站协议选渲染器 */
+function renderStream(result, { inbound, headers, model }) {
+  const meta = {
+    id: inbound === 'anthropic' ? anthropicMessageId() : randomId(inbound === 'responses' ? 'resp' : 'chatcmpl'),
+    model,
+    created: Math.floor(Date.now() / 1000),
+    includeUsage: true,
   };
 
-  for (const item of items) {
-    if (item?.type === 'message' && item.role === 'user') {
-      flush();
-      const parts = (Array.isArray(item.content) ? item.content : [{ type: 'input_text', text: String(item.content) }])
-        .map((c) => (c?.type === 'input_image' ? { type: 'image_url', image_url: { url: c.image_url } } : { type: 'text', text: c?.text ?? '' }));
-      messages.push({ role: 'user', content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts });
-    } else if (item?.type === 'message' && item.role === 'assistant') {
-      flush();
-      pendingAssistant = {
-        text: (item.content || []).map((c) => c?.text ?? '').join(''),
-        toolCalls: [],
-      };
-    } else if (item?.type === 'function_call') {
-      if (!pendingAssistant) pendingAssistant = { text: '', toolCalls: [] };
-      pendingAssistant.toolCalls.push({ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments ?? '' } });
-    } else if (item?.type === 'function_call_output') {
-      flush();
-      messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output ?? '' });
-    }
+  // 双端都是新协议，直接管道透传，零损耗
+  if (inbound === 'responses' && result.protocol === 'responses') {
+    return new Response(result.res.body, { status: 200, headers: sseHeaders(headers) });
   }
-  flush();
 
-  const out = { model, messages, stream: !!body.stream };
-  if (body.max_output_tokens) out.max_tokens = body.max_output_tokens;
-  if (body.temperature !== undefined) out.temperature = body.temperature;
-  if (body.top_p !== undefined) out.top_p = body.top_p;
-  if (Array.isArray(body.tools)) {
-    out.tools = body.tools.map((t) =>
-      t?.type === 'function'
-        ? { type: 'function', function: { name: t.name, description: t.description ?? '', parameters: t.parameters ?? {} } }
-        : t,
-    );
-  }
-  if (body.tool_choice !== undefined) {
-    out.tool_choice =
-      typeof body.tool_choice === 'string' ? body.tool_choice : { type: 'function', function: { name: body.tool_choice.name } };
-  }
-  if (body.text?.format?.type === 'json_object') out.response_format = { type: 'json_object' };
-  return out;
+  const events = result.protocol === 'responses' ? responsesStreamToEvents(result.res.body) : chatStreamToEvents(result.res.body);
+
+  let stream;
+  if (inbound === 'responses') stream = eventsToResponsesStream(events, meta);
+  else if (inbound === 'chat') stream = eventsToOpenAIChatStream(events, meta);
+  else stream = eventsToAnthropicStream(events, meta);
+
+  return new Response(stream, { status: 200, headers: sseHeaders(headers) });
 }
 
-/** chat.completion 对象 -> Responses 对象 */
-function chatObjectToResponses(resp, model) {
-  const msg = resp.choices?.[0]?.message ?? {};
-  const output = [];
-  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-    for (const call of msg.tool_calls) {
-      output.push({
-        type: 'function_call',
-        id: `fc_${call.id}`,
-        call_id: call.id,
-        name: call.function?.name ?? '',
-        arguments: call.function?.arguments ?? '',
-        status: 'completed',
-      });
-    }
-  }
-  const text = typeof msg.content === 'string' ? msg.content : '';
-  if (text) {
-    output.push({
-      type: 'message',
-      id: randomId('msg'),
-      role: 'assistant',
-      status: 'completed',
-      content: [{ type: 'output_text', text, annotations: [] }],
-    });
-  }
-  return {
-    id: resp.id || randomId('resp'),
-    object: 'response',
-    created_at: resp.created ?? Math.floor(Date.now() / 1000),
-    status: 'completed',
-    model: resp.model || model,
-    output,
-    output_text: text,
-    usage: resp.usage
-      ? {
-          input_tokens: resp.usage.prompt_tokens ?? 0,
-          output_tokens: resp.usage.completion_tokens ?? 0,
-          total_tokens: resp.usage.total_tokens ?? 0,
-        }
-      : undefined,
-  };
-}
+/* ------------------------------------------------------------------ */
+/* 模型列表                                                            */
+/* ------------------------------------------------------------------ */
 
-/** chat 事件流 -> Responses 事件流（降级路径） */
-function chatEventsToResponsesStream(events, model) {
-  const encoder = new TextEncoder();
-  const id = randomId('resp');
-  const created = Math.floor(Date.now() / 1000);
+async function handleModels(request, env, slug, baseHeaders) {
+  // 指定渠道时直接问上游要，结果最准
+  if (slug) {
+    const channel = await getChannelBySlug(env, slug);
+    if (!channel) return jsonResponse({ error: { message: `渠道 "${slug}" 不存在`, type: 'invalid_request_error' } }, 404, baseHeaders);
+    if (!channel.enabled) return jsonResponse({ error: { message: `渠道 "${slug}" 已停用`, type: 'invalid_request_error' } }, 403, baseHeaders);
 
-  return new ReadableStream({
-    async start(controller) {
-      const emit = (type, payload) =>
-        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`));
-
-      try {
-        let outputIndex = 0;
-        let textItemId = null;
-        let textStarted = false;
-        const toolItems = new Map();
-
-        emit('response.created', { response: { id, object: 'response', created_at: created, status: 'in_progress', model, output: [] } });
-
-        for await (const ev of events) {
-          if (ev.t === 'text_delta') {
-            if (!textStarted) {
-              textItemId = randomId('msg');
-              emit('response.output_item.added', {
-                output_index: outputIndex,
-                item: { type: 'message', id: textItemId, role: 'assistant', status: 'in_progress', content: [] },
-              });
-              emit('response.content_part.added', { output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
-              textStarted = true;
-            }
-            emit('response.output_text.delta', { output_index: outputIndex, content_index: 0, delta: ev.text });
-          } else if (ev.t === 'tool_start') {
-            if (textStarted) {
-              emit('response.content_part.done', { output_index, content_index: 0, part: { type: 'output_text', text: '' } });
-              emit('response.output_item.done', { output_index, item: { type: 'message', id: textItemId, role: 'assistant', status: 'completed', content: [] } });
-              outputIndex += 1;
-              textStarted = false;
-            }
-            const itemId = randomId('fc');
-            toolItems.set(ev.idx, { itemId, outputIndex, name: ev.name, callId: ev.id });
-            emit('response.output_item.added', {
-              output_index: outputIndex,
-              item: { type: 'function_call', id: itemId, call_id: ev.id, name: ev.name, arguments: '', status: 'in_progress' },
-            });
-          } else if (ev.t === 'tool_delta') {
-            const t = toolItems.get(ev.idx);
-            if (t) emit('response.function_call_arguments.delta', { output_index: t.outputIndex, item_id: t.itemId, delta: ev.args });
-          } else if (ev.t === 'tool_end') {
-            const t = toolItems.get(ev.idx);
-            if (t) {
-              emit('response.output_item.done', {
-                output_index: t.outputIndex,
-                item: { type: 'function_call', id: t.itemId, call_id: t.callId, name: t.name, arguments: '', status: 'completed' },
-              });
-              outputIndex += 1;
-            }
-          } else if (ev.t === 'finish') {
-            if (textStarted) {
-              emit('response.content_part.done', { output_index, content_index: 0, part: { type: 'output_text', text: '' } });
-              emit('response.output_item.done', { output_index, item: { type: 'message', id: textItemId, role: 'assistant', status: 'completed', content: [] } });
-            }
-            emit('response.completed', {
-              response: {
-                id,
-                object: 'response',
-                created_at: created,
-                status: 'completed',
-                model,
-                output: [],
-                usage: ev.usage
-                  ? {
-                      input_tokens: ev.usage.prompt_tokens ?? 0,
-                      output_tokens: ev.usage.completion_tokens ?? 0,
-                      total_tokens: ev.usage.total_tokens ?? 0,
-                    }
-                  : undefined,
-              },
-            });
-          } else if (ev.t === 'error') {
-            emit('error', { message: ev.message, code: ev.type });
-          }
-        }
-      } catch (err) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ type: 'error', message: String(err?.message || err) })}\n\n`));
-      } finally {
-        controller.close();
+    const vendor = getVendor(channel.vendor);
+    const url = buildUpstreamUrl(channel, 'models', vendor.apiVersion);
+    try {
+      const res = await fetch(url, { headers: buildHeaders(channel) });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        return jsonResponse({ error: { message: `上游返回 ${res.status}: ${text.slice(0, 300)}`, type: 'upstream_error' } }, res.status, baseHeaders);
       }
-    },
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* 辅助路由                                                             */
-/* ------------------------------------------------------------------ */
-
-async function handleModels(request, env, baseHeaders) {
-  const upstream = resolveUpstream(env, 'gpt-5');
-  const clientKey = extractClientKey(request);
-  const headers = new Headers({ 'content-type': 'application/json' });
-  const key = upstream.key || env?.UPSTREAM_KEY || clientKey;
-  if (key) headers.set('authorization', `Bearer ${key}`);
-
-  try {
-    const res = await fetch(`${upstream.base}/models`, { headers });
-    if (!res.ok) {
-      const err = await relayUpstreamError(res);
-      return errorResponse(err.message, err.status, err.type, { ...baseHeaders, 'X-Upstream-Base': upstream.base });
+      const json = await res.json();
+      return jsonResponse(json, 200, { ...baseHeaders, 'X-Channel-Slug': channel.slug });
+    } catch (err) {
+      return jsonResponse({ error: { message: `拉取失败: ${err?.message || err}`, type: 'upstream_error' } }, 502, baseHeaders);
     }
-    const json = await res.json();
-    return jsonResponse(json, 200, { ...baseHeaders, 'X-Upstream-Base': upstream.base });
-  } catch (err) {
-    return errorResponse(`拉取模型列表失败: ${err?.message || err}`, 502, 'upstream_error', baseHeaders);
   }
+
+  // 未指定渠道：聚合所有渠道声明的模型
+  const data = await listAllModels(env);
+  return jsonResponse({ object: 'list', data }, 200, baseHeaders);
 }
 
-async function handleCountTokens(request, env, baseHeaders) {
-  const body = await readJsonBody(request);
-  if (!body) return protocolError('请求体必须是合法 JSON', 400, 'invalid_request_error', baseHeaders, 'anthropic');
-
-  const { internal } = anthropicToInternal(body);
-  let text = internal.instructions || '';
-  for (const item of internal.input || []) {
-    if (item.type === 'message') {
-      for (const c of item.content || []) if (c?.text) text += c.text;
-    } else if (item.type === 'function_call') text += `${item.name}${item.arguments ?? ''}`;
-    else if (item.type === 'function_call_output') text += item.output ?? '';
-  }
-  for (const t of internal.tools || []) text += `${t.name}${t.description ?? ''}${JSON.stringify(t.parameters ?? {})}`;
-
-  return jsonResponse({ input_tokens: estimateTokens(text) }, 200, baseHeaders);
-}
+/* ------------------------------------------------------------------ */
+/* 工具                                                                */
+/* ------------------------------------------------------------------ */
 
 async function readJsonBody(request) {
   try {
@@ -536,4 +298,23 @@ async function readJsonBody(request) {
   } catch {
     return null;
   }
+}
+
+function extractKey(request) {
+  const auth = request.headers.get('authorization') || '';
+  const bearer = auth.match(/^Bearer\s+(.+)$/i);
+  if (bearer) return bearer[1].trim();
+  return request.headers.get('x-api-key') || '';
+}
+
+/** 按入站协议封装错误体 */
+function jsonError(message, type, status, inbound, extraHeaders = {}) {
+  if (inbound === 'anthropic') {
+    return jsonResponse(
+      { type: 'error', error: { type: status === 401 ? 'authentication_error' : 'api_error', message } },
+      status,
+      extraHeaders,
+    );
+  }
+  return jsonResponse({ error: { message, type, code: status === 401 ? 'invalid_api_key' : null } }, status, extraHeaders);
 }

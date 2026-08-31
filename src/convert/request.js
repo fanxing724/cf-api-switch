@@ -415,6 +415,120 @@ export function anthropicToInternal(body) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 入站：Responses API → internal                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 新协议请求体归一为 internal。
+ * 与 internalToResponses 互为逆运算，用在同一条链路上时字段无损。
+ */
+export function responsesToInternal(body) {
+  const warnings = [];
+  const instructionParts = [];
+  const input = [];
+
+  // input 支持字符串捷径
+  const items = Array.isArray(body.input)
+    ? body.input
+    : typeof body.input === 'string'
+      ? [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: body.input }] }]
+      : [];
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+
+    if (item.type === 'message') {
+      const role = item.role || 'user';
+      // system / developer 提到 instructions
+      if (role === 'system' || role === 'developer') {
+        const text = (item.content || [])
+          .map((c) => (typeof c === 'string' ? c : c?.text ?? ''))
+          .filter(Boolean)
+          .join('\n\n');
+        if (text) instructionParts.push(text);
+        continue;
+      }
+
+      let content = item.content;
+      // content 也允许是纯字符串
+      if (typeof content === 'string') {
+        content = [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+      }
+      input.push({ ...item, role, content: content || [] });
+      continue;
+    }
+
+    if (item.type === 'function_call' || item.type === 'function_call_output') {
+      input.push(item);
+      continue;
+    }
+
+    if (item.type === 'reasoning') {
+      // 思考项不回放到上游，由上游模型自行产生
+      warnings.push('输入中的 reasoning 项已跳过');
+      continue;
+    }
+
+    if (item.type === 'item_reference') {
+      warnings.push('输入中的 item_reference 需要服务端存储，已跳过');
+      continue;
+    }
+
+    // 其余 item 原样保留
+    input.push(item);
+  }
+
+  if (body.instructions) instructionParts.unshift(body.instructions);
+
+  // text.format / verbosity
+  let textFormat = null;
+  if (body.text?.format) {
+    const f = body.text.format;
+    if (f.type === 'json_object') textFormat = { type: 'json_object' };
+    else if (f.type === 'json_schema') textFormat = f;
+    else if (f.type === 'text') textFormat = null;
+    else textFormat = f;
+  }
+
+  let reasoning = undefined;
+  if (body.reasoning && typeof body.reasoning === 'object') {
+    reasoning = {};
+    if (body.reasoning.effort) reasoning.effort = body.reasoning.effort;
+    if (body.reasoning.summary) reasoning.summary = body.reasoning.summary;
+    if (!Object.keys(reasoning).length) reasoning = undefined;
+  } else if (typeof body.reasoning === 'string') {
+    reasoning = { effort: body.reasoning };
+  }
+
+  return {
+    internal: {
+      model: body.model,
+      instructions: instructionParts.join('\n\n') || undefined,
+      input,
+      tools: Array.isArray(body.tools) && body.tools.length ? body.tools : null,
+      toolChoice: body.tool_choice,
+      parallelToolCalls: body.parallel_tool_calls,
+      temperature: body.temperature,
+      topP: body.top_p,
+      maxOutputTokens: body.max_output_tokens,
+      textFormat,
+      verbosity: body.text?.verbosity,
+      reasoning,
+      stream: !!body.stream,
+      user: body.user,
+      stopSequences: [],
+      metadata: body.metadata,
+      previousResponseId: body.previous_response_id,
+      serviceTier: body.service_tier,
+      promptCacheKey: body.prompt_cache_key ?? body.safety_identifier,
+      store: body.store,
+      truncation: body.truncation,
+    },
+    warnings,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* 出站：internal → Responses API 请求体                                */
 /* ------------------------------------------------------------------ */
 

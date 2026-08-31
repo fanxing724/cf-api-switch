@@ -509,3 +509,216 @@ export function eventsToAnthropicStream(events, meta) {
 export function anthropicMessageId() {
   return `msg_${randomId('msg').replace(/^msg_/, '')}`;
 }
+
+/* ------------------------------------------------------------------ */
+/* IR → Responses API 事件流                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 把统一 IR 事件渲染成 Responses API 的 SSE 流。
+ * 用于「上游 chat 协议 → 客户端新协议」的场景：客户端拿到的是标准的
+ * response.created / output_text.delta / response.completed 事件序列。
+ */
+export function eventsToResponsesStream(events, meta) {
+  const { id, model, created } = meta;
+  const encoder = new TextEncoder();
+
+  return new ReadableStream({
+    async start(controller) {
+      const emit = (type, payload) =>
+        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`));
+
+      let outputIndex = 0;
+      let textItem = null; // { id, contentIndex }
+      let reasoningItem = null;
+      const tools = new Map(); // IR idx -> { itemId, outputIndex, name, callId }
+      let usage = null;
+      let status = 'completed';
+      let incompleteReason = null;
+
+      emit('response.created', {
+        response: { id, object: 'response', created_at: created, status: 'in_progress', model, output: [], parallel_tool_calls: true, tool_choice: 'auto', tools: [] },
+      });
+      emit('response.in_progress', { response: { id, object: 'response', created_at: created, status: 'in_progress', model, output: [] } });
+
+      const closeText = () => {
+        if (!textItem) return;
+        emit('response.content_part.done', {
+          output_index: textItem.outputIndex,
+          content_index: textItem.contentIndex,
+          part: { type: 'output_text', text: '', annotations: [] },
+        });
+        emit('response.output_item.done', {
+          output_index: textItem.outputIndex,
+          item: { type: 'message', id: textItem.id, role: 'assistant', status: 'completed', content: [] },
+        });
+        textItem = null;
+        outputIndex += 1;
+      };
+
+      const closeReasoning = () => {
+        if (!reasoningItem) return;
+        emit('response.output_item.done', {
+          output_index: reasoningItem.outputIndex,
+          item: { type: 'reasoning', id: reasoningItem.id, summary: [], status: 'completed' },
+        });
+        reasoningItem = null;
+        outputIndex += 1;
+      };
+
+      try {
+        for await (const ev of events) {
+          switch (ev.t) {
+            case 'start':
+              break;
+
+            case 'reasoning_delta': {
+              if (!reasoningItem) {
+                reasoningItem = { id: randomId('rs'), outputIndex };
+                emit('response.output_item.added', {
+                  output_index: outputIndex,
+                  item: { type: 'reasoning', id: reasoningItem.id, summary: [], status: 'in_progress' },
+                });
+              }
+              emit('response.reasoning_summary_text.delta', {
+                output_index: reasoningItem.outputIndex,
+                item_id: reasoningItem.id,
+                summary_index: 0,
+                delta: ev.text,
+              });
+              break;
+            }
+
+            case 'text_delta': {
+              closeReasoning();
+              if (!textItem) {
+                textItem = { id: randomId('msg'), outputIndex, contentIndex: 0 };
+                emit('response.output_item.added', {
+                  output_index: outputIndex,
+                  item: { type: 'message', id: textItem.id, role: 'assistant', status: 'in_progress', content: [] },
+                });
+                emit('response.content_part.added', {
+                  output_index: outputIndex,
+                  content_index: 0,
+                  part: { type: 'output_text', text: '', annotations: [] },
+                });
+              }
+              emit('response.output_text.delta', {
+                output_index: textItem.outputIndex,
+                content_index: textItem.contentIndex,
+                item_id: textItem.id,
+                delta: ev.text,
+              });
+              break;
+            }
+
+            case 'refusal_delta': {
+              closeReasoning();
+              if (!textItem) {
+                textItem = { id: randomId('msg'), outputIndex, contentIndex: 0 };
+                emit('response.output_item.added', {
+                  output_index: outputIndex,
+                  item: { type: 'message', id: textItem.id, role: 'assistant', status: 'in_progress', content: [] },
+                });
+              }
+              emit('response.refusal.delta', { output_index: textItem.outputIndex, item_id: textItem.id, delta: ev.text });
+              break;
+            }
+
+            case 'tool_start': {
+              closeReasoning();
+              closeText();
+              const itemId = randomId('fc');
+              tools.set(ev.idx, { itemId, outputIndex, name: ev.name, callId: ev.id });
+              emit('response.output_item.added', {
+                output_index: outputIndex,
+                item: { type: 'function_call', id: itemId, call_id: ev.id, name: ev.name, arguments: '', status: 'in_progress' },
+              });
+              break;
+            }
+
+            case 'tool_delta': {
+              const t = tools.get(ev.idx);
+              if (!t) break;
+              emit('response.function_call_arguments.delta', {
+                output_index: t.outputIndex,
+                item_id: t.itemId,
+                delta: ev.args,
+              });
+              break;
+            }
+
+            case 'tool_end': {
+              const t = tools.get(ev.idx);
+              if (!t) break;
+              emit('response.function_call_arguments.done', {
+                output_index: t.outputIndex,
+                item_id: t.itemId,
+                name: t.name,
+                arguments: '',
+              });
+              emit('response.output_item.done', {
+                output_index: t.outputIndex,
+                item: { type: 'function_call', id: t.itemId, call_id: t.callId, name: t.name, arguments: '', status: 'completed' },
+              });
+              outputIndex += 1;
+              break;
+            }
+
+            case 'finish': {
+              closeReasoning();
+              closeText();
+              if (ev.reason === 'length') {
+                status = 'incomplete';
+                incompleteReason = 'max_output_tokens';
+              } else if (ev.reason === 'content_filter') {
+                status = 'incomplete';
+                incompleteReason = 'content_filter';
+              }
+              if (ev.usage) usage = ev.usage;
+              break;
+            }
+
+            case 'error':
+              emit('error', { message: ev.message, code: ev.type || 'upstream_error' });
+              break;
+
+            default:
+              break;
+          }
+        }
+
+        const normalizedUsage = usage
+          ? {
+              input_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
+              output_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
+              total_tokens:
+                usage.total_tokens ??
+                (usage.input_tokens ?? usage.prompt_tokens ?? 0) + (usage.output_tokens ?? usage.completion_tokens ?? 0),
+              input_tokens_details: { cached_tokens: usage.input_tokens_details?.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0 },
+              output_tokens_details: { reasoning_tokens: usage.output_tokens_details?.reasoning_tokens ?? usage.completion_tokens_details?.reasoning_tokens ?? 0 },
+            }
+          : undefined;
+
+        const response = {
+          id,
+          object: 'response',
+          created_at: created,
+          status,
+          ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
+          model,
+          output: [],
+          parallel_tool_calls: true,
+          tool_choice: 'auto',
+          tools: [],
+          usage: normalizedUsage,
+        };
+        emit('response.completed', { response });
+      } catch (err) {
+        emit('error', { message: String(err?.message || err), code: 'bridge_error' });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+}

@@ -1,14 +1,15 @@
 # 本地开发用的变量模板。复制为 .dev.vars（该文件已被 .gitignore 忽略）后填写。
-# 生产环境请用 `npx wrangler secret put <NAME>` 写入，不要提交明文。
+# 注意：配了 KV 之后，面板的改动会写进 KV，这里的 CHANNELS 不再生效。
 
-# 上游 API Key（路由表里没单独配 key 时使用的兜底凭证）
-UPSTREAM_KEY=sk-your-openai-key
+# 无 KV 时的兜底渠道配置（JSON 数组）
+#   slug      路径标识，决定对外地址 https://<域名>/<slug>/v1/...
+#   vendor    generic | deepseek | ark
+#   protocol  openai-chat | responses
+#   models    白名单，留空表示不限制
+CHANNELS=[{"name":"DeepSeek","slug":"deepseek","baseUrl":"https://api.deepseek.com","apiKey":"sk-xxx","vendor":"deepseek","protocol":"openai-chat","models":["deepseek-chat","deepseek-reasoner"],"enabled":true},{"name":"火山方舟","slug":"ark","baseUrl":"https://ark.cn-beijing.volces.com/api/v3","apiKey":"xxx","vendor":"ark","protocol":"openai-chat","models":[],"enabled":true}]
 
-# 上游路由表（JSON 数组，按 match 前缀依次匹配，第一个命中生效；"*" 为兜底）
-UPSTREAM_ROUTES=[{"match":"gpt-","base":"https://api.openai.com/v1","protocol":"responses"},{"match":"o3","base":"https://api.openai.com/v1","protocol":"responses"},{"match":"grok-","base":"https://your-grok-host/v1","key":"g2a_xxx","protocol":"responses"},{"match":"*","base":"https://api.openai.com/v1","protocol":"responses"}]
+# 站点设置兜底：客户端 Key 与是否强制鉴权（正常走面板设置）
+SETTINGS={"requireAuth":false,"clientKeys":[]}
 
-# 客户端访问网关所需的 Key（多个用逗号分隔）。配合 vars 里的 REQUIRE_AUTH=true 生效
-CLIENT_API_KEY=my-secret-key
-
-# 模型别名：客户端模型名 -> 上游真实模型名
-MODEL_ALIASES={"claude-3-5-sonnet":"gpt-5","claude-sonnet-4":"gpt-5"}
+# 上游默认超时（毫秒）
+UPSTREAM_TIMEOUT_MS=120000

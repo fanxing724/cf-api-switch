@@ -6,7 +6,7 @@
  *   upstream chat      -> chat / anthropic
  */
 
-import { randomId, resolveFinishReason, usageToChat, usageToAnthropic } from '../util.js';
+import { randomId, resolveFinishReason, usageToChat, usageToAnthropic, usageToResponses } from '../util.js';
 
 /** 从 Responses 的 output 数组里提取文本、工具调用、思考内容 */
 export function extractResponsesOutput(output) {
@@ -126,6 +126,95 @@ export function responsesToAnthropic(resp, requestModel) {
     stop_sequence: null,
     usage: usageToAnthropic(resp.usage),
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* 上游 chat 响应 → Responses 响应对象                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * chat.completion 对象 → Responses 对象。
+ * 这是「老协议上游 → 新协议客户端」的主路径，reasoning_content
+ * （DeepSeek-R1 / 火山思考模型 / o1 系）会被还原成 reasoning 项。
+ */
+export function chatObjectToResponses(resp, requestModel) {
+  if (resp?.error) return { error: resp.error };
+
+  const msg = resp.choices?.[0]?.message ?? {};
+  const finish = resp.choices?.[0]?.finish_reason;
+  const output = [];
+
+  // 1. 思维链 -> reasoning 项
+  if (msg.reasoning_content) {
+    output.push({
+      type: 'reasoning',
+      id: randomId('rs'),
+      summary: [{ type: 'summary_text', text: msg.reasoning_content }],
+      status: 'completed',
+    });
+  }
+
+  // 2. 正文 -> message 项
+  const text = typeof msg.content === 'string' ? msg.content : extractChatText(msg.content);
+  if (text) {
+    output.push({
+      type: 'message',
+      id: randomId('msg'),
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text, annotations: [] }],
+    });
+  }
+
+  // 3. 工具调用 -> function_call 项
+  for (const call of msg.tool_calls || []) {
+    output.push({
+      type: 'function_call',
+      id: randomId('fc'),
+      call_id: call.id || randomId('call'),
+      name: call.function?.name ?? '',
+      arguments: call.function?.arguments ?? '',
+      status: 'completed',
+    });
+  }
+
+  if (msg.refusal) {
+    output.push({
+      type: 'message',
+      id: randomId('msg'),
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'refusal', refusal: msg.refusal }],
+    });
+  }
+
+  const status = finish === 'length' || finish === 'content_filter' ? 'incomplete' : 'completed';
+  const incompleteReason = finish === 'length' ? 'max_output_tokens' : finish === 'content_filter' ? 'content_filter' : null;
+
+  return {
+    id: resp.id?.startsWith('resp_') ? resp.id : `resp_${(resp.id || randomId('resp')).replace(/^chatcmpl-?/, '')}`,
+    object: 'response',
+    created_at: resp.created ?? Math.floor(Date.now() / 1000),
+    status,
+    ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
+    model: resp.model || requestModel,
+    output,
+    output_text: text || '',
+    parallel_tool_calls: true,
+    tool_choice: 'auto',
+    tools: [],
+    usage: usageToResponses(resp.usage),
+  };
+}
+
+function extractChatText(content) {
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c === 'string' ? c : c?.type === 'text' ? c.text : ''))
+      .filter(Boolean)
+      .join('');
+  }
+  return '';
 }
 
 /* ------------------------------------------------------------------ */

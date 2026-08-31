@@ -1,178 +1,164 @@
-# openai-protocol-bridge
+# cf-api-switch
 
-跑在 Cloudflare Workers 上的协议转换网关。老客户端照旧发 `/v1/chat/completions`（或直接发 Anthropic `/v1/messages`），网关在边缘把它们翻译成 OpenAI 新的 **Responses API** 调用，再把响应翻译回客户端期望的格式。
+跑在 Cloudflare Workers 上的**多渠道协议转换网关**。
 
-不用改一行业务代码，就能让旧生态（Cherry Studio、NextChat、Claude Code、各类 OpenAI SDK）吃到新协议模型。
+你手上那些只认老 `chat/completions` 的站点（DeepSeek、火山方舟、各种 NewAPI / one-api 中转），
+在这后面加一层，就统一变成 **OpenAI 新 Responses 协议**对外。老客户端不用改，新协议能力直接吃上。
 
 ```
-  旧客户端 / Claude Code                     Cloudflare Worker                    上游
-┌────────────────────────┐            ┌───────────────────────────┐        ┌──────────────────┐
-│ POST /v1/chat/completions │  ──────▶ │  1. 鉴权 + 模型别名        │ ──────▶ │ /v1/responses    │
-│ POST /v1/messages         │          │  2. 归一为 internal 结构   │        │  api.openai.com  │
-│ POST /v1/responses        │          │  3. 按前缀选上游 + 渲染     │ ──────▶ │ /v1/responses    │
-└────────────────────────┘  ◀──────── │  4. SSE 事件流互转         │        │  grok / 自建网关  │
-                                       └───────────────────────────┘        └──────────────────┘
+客户端                          Worker                              上游站点
+────────────────────────────  ──────────────────────────────────  ──────────────────
+/v1/responses          ┐       ┌ 解析路径：<渠道名>/v1/<端点>        DeepSeek
+/<渠道名>/v1/responses ├──────▶│ 入站协议 -> internal 中间表示   ──▶  火山方舟
+/v1/chat/completions   │       │ internal -> 该渠道的原生格式        NewAPI 站
+/v1/messages           ┘       └ 响应按入站协议翻译回去              OpenAI 官方
+                                      ▲
+                                      │ 渠道配置（Workers KV）
+                              ┌───────┴────────┐
+                              │  /_admin 面板   │
+                              └────────────────┘
 ```
+
+## 路由规则
+
+```
+https://<你的域名>/<渠道名>/v1/<端点>
+```
+
+斜杠后第一段是渠道标识（面板里配的「路径标识」），后面是标准端点。
+
+| 例子 | 含义 |
+| --- | --- |
+| `你的域名/deepseek/v1/responses` | 用新协议打 DeepSeek |
+| `你的域名/ark/v1/chat/completions` | 用旧协议打火山方舟 |
+| `你的域名/v1/responses` | 不带渠道名，按请求里的 `model` 自动选渠道 |
+| `你的域名/deepseek/v1/models` | 直接问该渠道要模型列表 |
+
+**入站协议由最后一段决定，出站协议由渠道配置决定**，两者解耦 —— 所以同一个 DeepSeek 渠道，
+你可以用新协议访问它，也可以让老客户端照旧用 chat 协议访问它。
 
 ## 快速开始
 
 ```bash
-# 1. 装依赖
 npm install
 
-# 2. 配上游（路由表 + 密钥）
-cp .dev.vars.example .dev.vars   # 本地开发
-npx wrangler secret put UPSTREAM_KEY      # 生产
-npx wrangler secret put UPSTREAM_ROUTES   # 生产
+# 1. 建 KV（存渠道配置，必须）
+npx wrangler kv namespace create cf_api_switch
+#    把输出的 id 填进 wrangler.toml 的 [[kv_namespaces]]，替换掉占位值
 
-# 3. 本地跑
-npm run dev      # http://127.0.0.1:8787
-
-# 4. 部署
+# 2. 部署
 npm run deploy
+
+# 3. 打开 https://<你的域名>/_admin
+#    设置管理员密码 -> 新增渠道 -> 填上游地址和 Key -> 「测试」确认连通
 ```
 
-本地自测（无需联网，会 mock 上游跑完 116 条断言）：
+本地联调：
 
 ```bash
-node scripts/check.mjs   # 协议字段映射 + 流式事件转换
-node scripts/e2e.mjs     # Worker 路由 / 鉴权 / 错误处理
+cp .dev.vars.example .dev.vars    # 可选：预置渠道，省得每次手填
+node scripts/mock-upstream.mjs    # 另开一个终端，8788 端口装成各家上游
+npm run dev                       # 8787
 ```
 
-## 端点
+自测（不联网，151 条断言）：
 
-| 方法 | 路径 | 说明 |
+```bash
+node scripts/check.mjs   # 协议字段映射 + 流式事件转换（71 条）
+node scripts/e2e.mjs     # 面板鉴权 / 渠道 CRUD / 主链路 / 故障转移（80 条）
+```
+
+## 入站 × 出站 转换矩阵
+
+入站三种协议都能接，出站按渠道配置渲染。已实现的组合：
+
+| 入站 | 上游是 chat 协议 | 上游是新协议 |
 | --- | --- | --- |
-| POST | `/v1/chat/completions` | OpenAI 兼容旧协议入口，转成 Responses 调用；响应按原格式返回 |
-| POST | `/v1/messages` | Anthropic Messages 入口，转成 Responses 调用；响应按 Anthropic 格式返回 |
-| POST | `/v1/messages/count_tokens` | Anthropic 客户端（如 Claude Code）会调用，返回估算值 |
-| POST | `/v1/responses` | 新协议原生入口。上游支持就透传，不支持会自动降级为 chat/completions |
-| GET | `/v1/models` | 模型列表透传 |
-| GET | `/healthz` | 健康检查 |
+| `/v1/responses` | 新协议 → chat，响应转回 Responses | 直接管道透传，零损耗 |
+| `/v1/chat/completions` | chat → chat，规范化后转发 | chat → Responses，响应转回 chat |
+| `/v1/messages` | Anthropic → chat，响应转回 Anthropic 格式 | Anthropic → Responses |
 
-## 字段映射
+三条入站路径都支持流式，客户端拿到的始终是自己那种协议的事件流。
 
-### 请求：chat/completions → Responses
+## 字段映射（新协议 ↔ 老协议）
 
-| chat/completions | Responses | 备注 |
+| Responses（新） | chat/completions（老） | 备注 |
 | --- | --- | --- |
-| `messages[role=system\|developer]` | `instructions` | 多条会合并 |
-| `messages[role=user].content[]` | `input[]{type:message,role:user}.content[]` | `text`→`input_text`，`image_url`→`input_image` |
-| `messages[role=assistant].content` | `input[]{role:assistant}.content[]` | 用 `output_text` 而非 `input_text` |
-| `messages[role=assistant].tool_calls` | `input[]{type:function_call}` | 从消息里拆成独立 item |
-| `messages[role=tool]` | `input[]{type:function_call_output}` | `tool_call_id`→`call_id` |
-| `tools[]{type:function,function:{}}` | `tools[]{type:function,name,...}` | 两层包装 → 扁平结构 |
-| `tool_choice:{type:function,function:{name}}` | `tool_choice:{type:function,name}` | 字符串值 `none/auto/required` 直通 |
-| `max_tokens` / `max_completion_tokens` | `max_output_tokens` | |
-| `response_format:{type:json_object}` | `text.format:{type:json_object}` | `json_schema` 同理 |
-| `reasoning_effort` / `reasoning` | `reasoning:{effort,summary}` | |
-| `stream` | `stream` | 事件流在网关内互转 |
-| `stop` | `instructions` 软提示 | 新协议无对应字段，见下方「已知取舍」 |
-| `seed` / `logprobs` / `n` / `logit_bias` / `presence_penalty` / `frequency_penalty` | — | 新协议不支持，忽略并在 `X-Bridge-Warnings` 里提示 |
+| `instructions` | `messages[role=system]` | 多条合并 |
+| `input` 字符串 | `messages[role=user].content` | 单轮纯文本时压缩 |
+| `input[]{type:message}` | `messages[]` | `input_text`↔`text`、`input_image`↔`image_url` |
+| `input[]{type:function_call}` | `messages[].tool_calls` | `call_id` ↔ `id` |
+| `input[]{type:function_call_output}` | `messages[role=tool]` | |
+| `tools[]{type:function,name,...}` | `tools[]{type:function,function:{}}` | 扁平 ↔ 两层包装 |
+| `max_output_tokens` | `max_tokens` | |
+| `text.format` | `response_format` | `json_object` / `json_schema` |
+| `reasoning.effort` | `reasoning_effort` | |
+| `output[]{type:reasoning}` | `message.reasoning_content` | DeepSeek-R1 / 火山思考模型 / o1 系 |
+| `output[]{type:function_call}` | `message.tool_calls` | |
+| `usage.input_tokens` | `usage.prompt_tokens` | 含 `*_tokens_details` 回填 |
 
-### 请求：Anthropic Messages → Responses
+## 厂商差异
 
-| Anthropic | Responses |
+各家本质都是 OpenAI 兼容格式，差异点已收敛到 `src/vendors/`：
+
+| 厂商 | 差异处理 |
 | --- | --- |
-| `system`（string 或 blocks） | `instructions` |
-| `content[]{type:image,source:{type:base64}}` | `input_image.image_url`（拼成 data URI） |
-| `content[]{type:tool_use,id,name,input}` | `function_call{call_id,name,arguments}`（`input` 会被 `JSON.stringify`） |
-| `content[]{type:tool_result}` | `function_call_output{call_id,output}` |
-| `tools[]{name,input_schema}` | `tools[]{type:function,name,parameters}` |
-| `tool_choice:{type:auto\|any\|tool}` | `tool_choice:"auto"\|"required"\|{type:function,name}` |
-| `max_tokens` | `max_output_tokens` |
-| `stop_sequences` | `instructions` 软提示 |
-| `content[]{type:thinking}` | 跳过（思考由上游模型自己产出） |
+| **通用**（默认） | 直接转发。适用于 NewAPI / one-api / 各类中转站 |
+| **DeepSeek** | R1 系列不向上游传 `temperature` / `top_p`（官方建议）；剔除 `logit_bias`、`n`；响应的 `reasoning_content` 映射成新协议的 reasoning 项 |
+| **火山方舟** | URL 版本号写在 base 里（`/api/v3`），不重复拼 `/v1`；剔除 `logit_bias`、`user`；模型名填控制台的接入点 ID（`ep-xxxx`） |
 
-### 响应：Responses → chat/completions
+新增厂商只需在 `src/vendors/index.js` 加一个对象，实现 `transformRequest` 与 `apiVersion` 即可。
 
-`output[]` 里的 `message` 取文本、`function_call` 收集成 `tool_calls`、`reasoning` 的摘要挂到 `message.reasoning_content`（国内客户端普遍支持这个字段）。
+## 管理面板
 
-状态映射：`completed` → `stop`（有工具调用时 `tool_calls`）；`incomplete/max_output_tokens` → `length`；`incomplete/content_filter` → `content_filter`。
+访问 `/_admin`：
 
-usage 双向换算：`input_tokens ↔ prompt_tokens`、`output_tokens ↔ completion_tokens`，并回填 `*_tokens_details`。
+- **渠道管理**：增删改查、启停、权重（同模型多渠道时大的优先）、超时
+- **连通性测试**：发一个真实请求，区分「鉴权失败」和「已连通但请求被拒」
+- **一键拉模型**：从上游 `/models` 拉真实列表回填到白名单
+- **访问设置**：客户端 API Key（逗号分隔）+ 是否强制鉴权
+- **改密码**
 
-### 流式
+安全设计：
 
-一条统一中间事件流，两种渲染器：
+- 密码用 PBKDF2-SHA256 派生后存 KV，**不存明文**
+- 登录态是 HMAC-SHA256 签名的 `HttpOnly` + `Secure` + `SameSite=Lax` cookie，12 小时过期
+- 列表接口返回的 API Key **一律掩码**（`sk-dee****8888`），明文不回前端
+- 写操作全部校验登录态，未初始化密码时返回明确引导而非笼统 401
 
-```
-上游 Responses SSE  ─┐
-                     ├─▶ IR 事件 ─┬─▶ chat.completion.chunk 流（带 [DONE]）
-上游 chat SSE       ─┘            └─▶ Anthropic 事件流（message_start → … → message_stop）
-```
+## 故障转移
 
-- 工具调用按下游协议重新编号，arguments 增量能拼回合法 JSON
-- 结束帧带 `finish_reason`，随后补一帧 `choices: []` 的 usage（可用 `ALWAYS_INCLUDE_USAGE=false` 关掉）
-- Anthropic 侧不发 `[DONE]`，符合其规范
+同一个模型配了多个渠道时，按权重降序依次尝试：
 
-## 配置
+- **5xx / 429 / 网络超时** → 自动切下一个渠道
+- **4xx** → 直接返回，不重试（是请求或配置问题，换渠道也没用）
+- 重试次数写在响应头 `X-Fallback-Attempts` 里
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `UPSTREAM_ROUTES` | OpenAI 官方 | JSON 数组路由表，见下 |
-| `UPSTREAM_BASE` | `https://api.openai.com/v1` | 未配路由表时的兜底上游 |
-| `UPSTREAM_KEY` | — | 兜底上游密钥；路由未单独配置时使用 |
-| `CLIENT_API_KEY` | — | 客户端密钥，逗号分隔；需配合 `REQUIRE_AUTH=true` |
-| `REQUIRE_AUTH` | `false` | 是否校验客户端密钥 |
-| `MODEL_ALIASES` | `{}` | 模型别名，如 `{"claude-sonnet-4":"gpt-5"}` |
-| `ALWAYS_INCLUDE_USAGE` | `true` | 流式末尾是否总是补 usage 帧 |
-| `STOP_AS_HINT` | `true` | 把 `stop` / `stop_sequences` 作为软提示写进 instructions |
-| `STORE_RESPONSE` | `false` | 对应 Responses 的 `store` 字段 |
-| `UPSTREAM_TIMEOUT_MS` | `600000` | 上游超时 |
-| `CORS_ALLOW_ORIGIN` | `*` | 跨域来源 |
+## 调试
 
-### 路由表
+响应头会告诉你实际发生了什么：
 
-按 `match` 前缀**顺序匹配**，第一个命中生效；建议把更具体的前缀放在前面。`"*"` 为兜底。
+| 响应头 | 内容 |
+| --- | --- |
+| `X-Channel-Slug` / `X-Channel-Id` | 命中的渠道 |
+| `X-Upstream-Url` | 实际请求的完整上游地址 |
+| `X-Upstream-Protocol` | 出站用的协议（`openai-chat` / `responses`） |
+| `X-Fallback-Attempts` | 失败重试过几次 |
+| `X-Bridge-Warnings` | 被丢弃或降级的字段（URL 编码） |
 
-```json
-[
-  { "match": "gpt-5-",  "base": "https://api.openai.com/v1", "protocol": "responses" },
-  { "match": "grok-",   "base": "https://grok.example.com/v1", "key": "g2a_xxx", "protocol": "responses" },
-  { "match": "deepseek","base": "https://api.deepseek.com/v1", "key": "sk-xxx", "protocol": "chat" },
-  { "match": "*",       "base": "https://api.openai.com/v1", "key": "sk-xxx", "protocol": "responses" }
-]
-```
+## 环境变量
 
-- `protocol: "responses"`（默认）——上游说新协议，网关做 chat → Responses 转换
-- `protocol: "chat"` ——上游只认旧协议，网关**直接透传**原请求，不做无谓的来回转换，字段零损耗
-- `headers` 可选，用于那些不走 `Authorization: Bearer` 的上游（如 `{"x-api-key": "..."}`）
-
-## 客户端接入
-
-**OpenAI SDK / 任何 OpenAI 兼容客户端**
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="https://<your-worker>.workers.dev/v1", api_key="任意值")
-print(client.chat.completions.create(model="gpt-5", messages=[{"role": "user", "content": "hi"}]).choices[0].message.content)
-```
-
-**Claude Code**
-
-```bash
-export ANTHROPIC_BASE_URL="https://<your-worker>.workers.dev"
-export ANTHROPIC_AUTH_TOKEN="任意值"
-export ANTHROPIC_MODEL="gpt-5"        # 或配 MODEL_ALIASES 让 claude-* 自动映射
-claude
-```
-
-**curl**
-
-```bash
-curl https://<your-worker>.workers.dev/v1/chat/completions \
-  -H "Authorization: Bearer any" -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5","messages":[{"role":"user","content":"一句话介绍 Cloudflare Workers"}]}'
-```
-
-调不通时看响应头：`X-Upstream-Base` / `X-Upstream-Protocol` / `X-Upstream-Model` 告诉你实际打到哪，`X-Bridge-Warnings`（URL 编码）告诉你哪些字段被丢弃了。
+| 变量 | 说明 |
+| --- | --- |
+| `KV`（binding） | 渠道与设置的存储，**必须配置** |
+| `CHANNELS` | 无 KV 时的兜底渠道配置（JSON 数组） |
+| `SETTINGS` | 无 KV 时的兜底站点设置 |
+| `UPSTREAM_TIMEOUT_MS` | 默认超时，渠道里可单独覆盖 |
+| `CORS_ALLOW_ORIGIN` | 跨域来源 |
 
 ## 已知取舍
 
-- **`stop` 无对应字段**：新协议取消了 `stop`，默认降级成 instructions 里的软提示（不保证 100% 停住）。想要严格截断就把 `STOP_AS_HINT` 关掉，自己在后置处理里切。
-- **单轮纯文本会压缩成 `input` 字符串**：省 token 也更贴近手写调用；多轮/多模态仍走数组。
-- **`store` 默认 `false`**：网关定位是转发，默认不让上游落库。要用 `previous_response_id` 做多轮续接就设成 `true`。
-- **一张图大约 0.5–2KB 的 base64 会原样转发**，Workers 请求体上限 100MB，正常用量无碍。
-- **Responses 原生工具**（`web_search_preview`、`file_search`、`computer_use` 等）不在 `tools[]` 里做转换，原样透传。
-- **Anthropic 的 `thinking` 块不回放**，由上游模型自行产出 reasoning。
+- **新协议没有 `stop`**：早前版本会把 `stop` 降级成 instructions 软提示；现在主链路是「新协议入站 → 老协议出站」，`stop` 由入站侧决定，用 `/v1/chat/completions` 入站时可正常使用。
+- **`reasoning_content` 只做单向还原**：上游老协议 → 客户端新协议。反向（客户端在新协议里塞 reasoning 项进来）会被跳过。
+- **未绑定 KV 时配置不持久化**：面板会顶部横幅警告。本地 dev 想持久化可以 `--persist-to .wrangler/state`。
+- **流式中途失败无法回退**：故障转移只在「发起请求」阶段生效。一旦上游开始返回 200 并吐流，中途断了就只能把错误事件传给客户端。
