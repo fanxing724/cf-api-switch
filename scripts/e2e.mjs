@@ -248,6 +248,27 @@ section('3. 客户端鉴权');
 }
 
 /* ================================================================== */
+section('3b. 统一密匙安全边界');
+
+{
+  // 开鉴权但没配密匙：任何请求都应被拒，避免网关意外敞开
+  await post('/_admin/api/settings', { requireAuth: true, clientKeys: [] }, authHeaders());
+  const open = await post('/deepseek/v1/responses', { model: 'deepseek-chat', input: 'hi' });
+  check('开鉴权但无密匙 → 直接拒绝（401）', open.status === 401, open.status);
+  const openModels = await req('/v1/models');
+  check('开鉴权但无密匙 → /v1/models 也被拒（401）', openModels.status === 401, openModels.status);
+
+  // 配上统一密匙后，/v1/models 同样受保护（统一密匙既管推理也管模型列表）
+  await post('/_admin/api/settings', { requireAuth: true, clientKeys: ['sk-unified-1'] }, authHeaders());
+  const noKey = await req('/v1/models');
+  check('有密匙但未携带 → /v1/models 被拒（401）', noKey.status === 401, noKey.status);
+  const withKey = await req('/v1/models', { headers: { authorization: 'Bearer sk-unified-1' } });
+  check('携带统一密匙 → /v1/models 放行（200）', withKey.status === 200, withKey.status);
+
+  await post('/_admin/api/settings', { requireAuth: false, clientKeys: [] }, authHeaders());
+}
+
+/* ================================================================== */
 section('4. 主链路：responses 入站 → chat 上游');
 
 {

@@ -70,6 +70,20 @@ export default {
 
       const { slug, endpoint } = route;
 
+      // ---- 客户端鉴权（统一密匙）--------------------------------------
+      // 开鉴权后，所有非管理请求（含 /v1/models）都必须持有效统一密匙；
+      // 若开了鉴权却没配密匙，直接拒绝，避免网关意外敞开。
+      const settings = await getSettings(env);
+      if (settings.requireAuth) {
+        if (!settings.clientKeys.length) {
+          return jsonError('网关已开启鉴权但未配置统一密匙，请到面板「访问设置」添加', 'invalid_request_error', 401, inferInbound(endpoint), baseHeaders);
+        }
+        const key = extractKey(request);
+        if (!settings.clientKeys.includes(key)) {
+          return jsonError('Invalid API key', 'invalid_request_error', 401, inferInbound(endpoint), baseHeaders);
+        }
+      }
+
       // ---- 模型列表 ---------------------------------------------------
       if (request.method === 'GET' && endpoint === 'models') {
         return handleModels(request, env, slug, baseHeaders);
@@ -77,15 +91,6 @@ export default {
 
       if (request.method !== 'POST') {
         return jsonError('只支持 POST 请求', 'invalid_request_error', 405, 'chat', baseHeaders);
-      }
-
-      // ---- 客户端鉴权 -------------------------------------------------
-      const settings = await getSettings(env);
-      if (settings.requireAuth && settings.clientKeys.length) {
-        const key = extractKey(request);
-        if (!settings.clientKeys.includes(key)) {
-          return jsonError('Invalid API key', 'invalid_request_error', 401, inferInbound(endpoint), baseHeaders);
-        }
       }
 
       const body = await readJsonBody(request);
