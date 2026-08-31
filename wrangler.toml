@@ -2,17 +2,11 @@ name = "cf-api-switch"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
-# ---------------------------------------------------------------------------
-# ⚠ 部署前必做：下面这个 id 是占位值，本地 `wrangler dev` 能跑，
-#   但 `wrangler deploy` 会报找不到 namespace。请先执行：
-#
-#     npx wrangler kv namespace create cf_api_switch
-#
-#   把输出的 id 替换掉下面这行，再部署。预览环境可另建一个填进 preview_id。
-# ---------------------------------------------------------------------------
+# 渠道配置存在 Workers KV 里。
+# 如需另建（比如给预览环境单独一个）：npx wrangler kv namespace create <名字>
 [[kv_namespaces]]
 binding = "KV"
-id = "0123456789abcdef0123456789abcdef"
+id = "b6de9e299dbe4455b4d7152bf1efedb4"
 # preview_id = "可选，预览环境用的 namespace id"
 
 [observability]
