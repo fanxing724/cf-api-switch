@@ -1,0 +1,61 @@
+name = "openai-protocol-bridge"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# 生产日志：打开后可在 `wrangler tail` 看到每条请求的路由/转换结果
+[observability]
+enabled = true
+
+[vars]
+# ---------------------------------------------------------------------------
+# 上游路由表（JSON 数组）。按顺序匹配，命中第一个 match 的路由。
+#   match    : 模型名前缀；"*" 或 "default" 表示兜底
+#   base     : 上游地址（不含结尾斜杠），例如 https://api.openai.com/v1
+#   key      : 该上游的 API Key（可选；缺省时回落到 UPSTREAM_KEY，再回落到客户端透传）
+#   protocol : "responses"（默认，走新协议）| "chat"（上游只支持旧协议时直通）
+#
+# 建议用 `wrangler secret put UPSTREAM_ROUTES` 存密钥，避免明文进仓库。
+# ---------------------------------------------------------------------------
+UPSTREAM_ROUTES = '''
+[
+  { "match": "gpt-",     "base": "https://api.openai.com/v1", "protocol": "responses" },
+  { "match": "o1",       "base": "https://api.openai.com/v1", "protocol": "responses" },
+  { "match": "o3",       "base": "https://api.openai.com/v1", "protocol": "responses" },
+  { "match": "o4",       "base": "https://api.openai.com/v1", "protocol": "responses" },
+  { "match": "computer", "base": "https://api.openai.com/v1", "protocol": "responses" },
+  { "match": "*",        "base": "https://api.openai.com/v1", "protocol": "responses" }
+]
+'''
+
+# 兜底上游（路由表为空 / 未命中时使用）
+UPSTREAM_BASE = "https://api.openai.com/v1"
+
+# 模型别名映射（JSON 对象）：客户端模型名 -> 上游真实模型名
+# 例：让 Claude Code 里填的 claude-* 实际打到 gpt-5
+MODEL_ALIASES = '{}'
+
+# 是否要求客户端鉴权。设为 "true" 时，请求必须带上 CLIENT_API_KEY 之一
+REQUIRE_AUTH = "false"
+
+# 流式响应是否始终在末尾补一条 usage chunk（很多第三方客户端依赖它）
+ALWAYS_INCLUDE_USAGE = "true"
+
+# 旧协议的 stop / stop_sequences 在新协议里没有对应字段。
+# 为 "true" 时把它们作为软提示追加进 instructions，降低客户端行为差异
+STOP_AS_HINT = "true"
+
+# 是否让 OpenAI 持久化存储响应内容（关掉更省、更隐私）
+STORE_RESPONSE = "false"
+
+# 上游超时（毫秒）
+UPSTREAM_TIMEOUT_MS = "600000"
+
+# 允许跨域的来源，"*" 表示全部
+CORS_ALLOW_ORIGIN = "*"
+
+# ---------------------------------------------------------------------------
+# 以下敏感项请用 wrangler secret 写入，不要写在这里：
+#   npx wrangler secret put UPSTREAM_KEY
+#   npx wrangler secret put CLIENT_API_KEY
+#   npx wrangler secret put UPSTREAM_ROUTES
+# ---------------------------------------------------------------------------

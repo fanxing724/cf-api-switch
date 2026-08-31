@@ -1,0 +1,20 @@
+{
+  "name": "openai-protocol-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that bridges legacy OpenAI-compatible /v1/chat/completions and Anthropic /v1/messages traffic onto the new OpenAI /v1/responses protocol.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "check": "node scripts/check.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

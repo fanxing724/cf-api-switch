@@ -1,0 +1,14 @@
+# 本地开发用的变量模板。复制为 .dev.vars（该文件已被 .gitignore 忽略）后填写。
+# 生产环境请用 `npx wrangler secret put <NAME>` 写入，不要提交明文。
+
+# 上游 API Key（路由表里没单独配 key 时使用的兜底凭证）
+UPSTREAM_KEY=sk-your-openai-key
+
+# 上游路由表（JSON 数组，按 match 前缀依次匹配，第一个命中生效；"*" 为兜底）
+UPSTREAM_ROUTES=[{"match":"gpt-","base":"https://api.openai.com/v1","protocol":"responses"},{"match":"o3","base":"https://api.openai.com/v1","protocol":"responses"},{"match":"grok-","base":"https://your-grok-host/v1","key":"g2a_xxx","protocol":"responses"},{"match":"*","base":"https://api.openai.com/v1","protocol":"responses"}]
+
+# 客户端访问网关所需的 Key（多个用逗号分隔）。配合 vars 里的 REQUIRE_AUTH=true 生效
+CLIENT_API_KEY=my-secret-key
+
+# 模型别名：客户端模型名 -> 上游真实模型名
+MODEL_ALIASES={"claude-3-5-sonnet":"gpt-5","claude-sonnet-4":"gpt-5"}
