@@ -43,7 +43,7 @@ async function writeJson(env, key, value) {
 }
 
 /** 渠道默认字段 */
-function normalizeChannel(input) {
+export function normalizeChannel(input) {
   const slug = String(input.slug || '')
     .trim()
     .toLowerCase()

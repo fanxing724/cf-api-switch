@@ -14,6 +14,7 @@ import {
   maskKey,
   storageMode,
   buildUpstreamUrl,
+  normalizeChannel,
 } from '../store.js';
 import { buildHeaders, buildRequest } from '../channels.js';
 import { VENDOR_LIST, resolveApiVersion } from '../vendors/index.js';
@@ -75,6 +76,29 @@ export async function handleAdminApi(request, env, segs) {
 
       case 'vendors':
         return jsonResponse({ vendors: VENDOR_LIST }, 200, cors);
+
+      case 'probe': {
+        // 不依赖已保存渠道：直接用表单里的临时值去上游探测（拉模型 / 测连通）。
+        // 传了 id 则优先用服务器上已保存的渠道，表单里新填的字段再覆盖。
+        const body = await readJson(request) || {};
+        if (!body.id && !body.baseUrl) {
+          return jsonResponse({ error: '请先填写上游地址（或选择已保存的渠道）' }, 400, cors);
+        }
+
+        let channel = null;
+        if (body.id) channel = await getChannelById(env, body.id);
+        if (!channel) channel = normalizeChannel({ name: 'probe', slug: 'probe' });
+        if (body.baseUrl !== undefined && body.baseUrl !== '') channel.baseUrl = body.baseUrl;
+        if (body.apiKey !== undefined && body.apiKey !== '') channel.apiKey = body.apiKey;
+        if (body.vendor !== undefined && body.vendor !== '') channel.vendor = body.vendor;
+        if (body.apiVersion !== undefined) channel.apiVersion = body.apiVersion;
+        if (body.dropParams !== undefined) channel.dropParams = body.dropParams;
+
+        const op = segs[1];
+        if (op === 'models') return jsonResponse(await fetchUpstreamModels(channel), 200, cors);
+        if (op === 'test') return jsonResponse(await testChannel(channel), 200, cors);
+        return jsonResponse({ error: 'probe 需要 models 或 test 操作' }, 404, cors);
+      }
 
       case 'channels': {
         if (request.method === 'GET') {

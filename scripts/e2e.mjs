@@ -631,5 +631,48 @@ section('9. 自定义厂商（厂商可自由填写）');
 }
 
 /* ================================================================== */
+section('10. probe 探测端点（不依赖已保存渠道）');
+
+{
+  // 用表单临时值直接拉模型，不需要先保存渠道
+  captured = [];
+  mockImpl = async () => jsonRes({ object: 'list', data: [{ id: 'm-alpha' }, { id: 'm-beta' }, { id: 'm-gamma' }] });
+  const res = await post('/_admin/api/probe/models', {
+    baseUrl: 'https://probe.example.com/v1',
+    apiKey: 'temp-key',
+    vendor: 'generic',
+  }, authHeaders());
+  const out = await res.json();
+  check('probe/models 用临时参数拉取成功', res.status === 200 && out.ok === true, out);
+  check('模型列表正确', out.models?.length === 3 && out.models[0] === 'm-alpha', out.models);
+  check('URL 版本段正确拼接', captured[0].url === 'https://probe.example.com/v1/models', captured[0].url);
+  check('用临时 key 鉴权', captured[0].headers.get('authorization') === 'Bearer temp-key');
+}
+
+{
+  // 传已保存渠道 id，用服务器上的 baseUrl，但覆盖新填的 key
+  captured = [];
+  mockImpl = async () => jsonRes({ object: 'list', data: [{ id: 'existing-model' }] });
+  const res = await post('/_admin/api/probe/models', { id: deepseekId, apiKey: 'new-key' }, authHeaders());
+  const out = await res.json();
+  check('probe/models 传 id 复用已保存渠道', out.ok === true && out.models?.includes('existing-model'), out);
+  check('新填的 key 覆盖旧 key', captured[0].headers.get('authorization') === 'Bearer new-key');
+}
+
+{
+  // probe/test 临时测试连通
+  mockImpl = async () => jsonRes(chatResponse('probe ok'));
+  const res = await post('/_admin/api/probe/test', { baseUrl: 'https://probe.example.com', apiKey: 'k' }, authHeaders());
+  const out = await res.json();
+  check('probe/test 临时测试连通', res.status === 200 && out.ok === true && out.status === 200, out);
+}
+
+{
+  // 缺 baseUrl 且缺 id 时拒绝
+  const res = await post('/_admin/api/probe/models', { apiKey: 'k' }, authHeaders());
+  check('probe 缺地址被拒（400）', res.status === 400, res.status);
+}
+
+/* ================================================================== */
 console.log(`\n${failed === 0 ? '\x1b[32m' : '\x1b[31m'}${passed} passed, ${failed} failed\x1b[0m\n`);
 process.exit(failed === 0 ? 0 : 1);
